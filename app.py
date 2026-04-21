@@ -23,7 +23,7 @@ print("SUPABASE_KEY carregada =", bool(os.getenv("SUPABASE_KEY")))
 load_dotenv()
 
 app = Flask(__name__)
-CORS(CORS(app, origins=["https://pulse-z1b2.vercel.app/", "http://localhost:5000"]))
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # ── CLIENTES ──────────────────────────────────────────────────────────────────
 
