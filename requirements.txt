@@ -1,5 +1,5 @@
 flask==3.0.3
-flask-cors==4.0.1
+flask-cors==3.0.10
 google-api-python-client==2.131.0
 anthropic==0.28.0
 supabase==2.4.6
