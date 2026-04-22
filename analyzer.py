@@ -6,7 +6,7 @@ import json
 import anthropic
 
 MODEL = "claude-haiku-4-5-20251001"
-BATCH_SIZE = 80   # comentários por chamada (cabe bem no contexto do Haiku)
+BATCH_SIZE = 200   # comentários por chamada (cabe bem no contexto do Haiku)
 
 
 PROMPT_TEMPLATE = """\
