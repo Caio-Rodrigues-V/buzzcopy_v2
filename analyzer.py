@@ -55,8 +55,8 @@ class SentimentAnalyzer:
 
     def _analyze_batch(self, comments: list, profile_name: str) -> dict:
         comments_text = "\n".join(
-            f"[{c['comment_id']}] {c['text']}"
-            for c in comments
+        f"[{c['comment_id']}] {c['text'][:150]}"
+        for c in comments
         )
 
         prompt = PROMPT_TEMPLATE.format(
