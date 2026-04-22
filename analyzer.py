@@ -7,7 +7,7 @@ import anthropic
 from json_repair import repair_json
 
 MODEL = "claude-haiku-4-5-20251001"
-BATCH_SIZE = 200
+BATCH_SIZE = 50
 
 
 PROMPT_TEMPLATE = """\
@@ -68,7 +68,7 @@ class SentimentAnalyzer:
 
         response = self.client.messages.create(
             model=MODEL,
-            max_tokens=4096,
+            max_tokens=8096,
             messages=[{"role": "user", "content": prompt}],
         )
 
