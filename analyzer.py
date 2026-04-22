@@ -3,6 +3,7 @@ analyzer.py — Análise de sentimento e geração de relatório via Claude API
 """
 
 import json
+from json_repair import repair_json
 import anthropic
 
 MODEL = "claude-haiku-4-5-20251001"
@@ -90,7 +91,7 @@ class SentimentAnalyzer:
         if start != -1 and end > start:
             raw = raw[start:end]
 
-        return json.loads(raw)
+        return json.loads(repair_json(raw))
 
     def _merge_batches(self, batch_results: list, total_comments: int) -> dict:
         all_sentiments = []
