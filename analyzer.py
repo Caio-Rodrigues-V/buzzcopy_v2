@@ -6,7 +6,7 @@ import json
 import anthropic
 
 MODEL = "claude-haiku-4-5-20251001"
-BATCH_SIZE = 200   # comentários por chamada (cabe bem no contexto do Haiku)
+BATCH_SIZE = 200
 
 
 PROMPT_TEMPLATE = """\
@@ -53,10 +53,7 @@ class SentimentAnalyzer:
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    # ── INTERNAL ─────────────────────────────────────────────────────────────
-
     def _analyze_batch(self, comments: list, profile_name: str) -> dict:
-        """Envia um batch de comentários para o Claude e retorna o JSON parseado."""
         comments_text = "\n".join(
             f"[{c['comment_id']}] {c['text']}"
             for c in comments
@@ -76,18 +73,18 @@ class SentimentAnalyzer:
 
         raw = response.content[0].text.strip()
 
-# Remove blocos markdown
+        # Remove blocos markdown
         if "```" in raw:
-         parts = raw.split("```")
-        for part in parts:
-            part = part.strip()
-            if part.startswith("json"):
-                part = part[4:].strip()
-            if part.startswith("{"):
-                raw = part
-                break
+            parts = raw.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
 
-    # Extrai só o JSON se tiver texto antes/depois
+        # Extrai só o JSON ignorando texto antes/depois
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start != -1 and end > start:
@@ -96,20 +93,16 @@ class SentimentAnalyzer:
         return json.loads(raw)
 
     def _merge_batches(self, batch_results: list, total_comments: int) -> dict:
-        """Combina os resultados de múltiplos batches em um único relatório."""
         all_sentiments = []
         for b in batch_results:
             all_sentiments.extend(b.get("sentiments", []))
 
-        # Recalcula percentuais globais
         pos = sum(1 for s in all_sentiments if s["sentiment"] == "positive")
         neg = sum(1 for s in all_sentiments if s["sentiment"] == "negative")
         neu = sum(1 for s in all_sentiments if s["sentiment"] == "neutral")
         total = len(all_sentiments) or 1
-
         overall = sum(s["score"] for s in all_sentiments) / total
 
-        # Junta temas de todos os batches (dedup simples)
         all_themes = []
         for b in batch_results:
             all_themes.extend(b["summary"].get("main_themes", []))
@@ -119,7 +112,7 @@ class SentimentAnalyzer:
                 seen.add(t.lower())
                 unique_themes.append(t)
 
-        crisis_alert  = any(b["summary"].get("crisis_alert") for b in batch_results)
+        crisis_alert = any(b["summary"].get("crisis_alert") for b in batch_results)
         crisis_reason = next(
             (b["summary"].get("crisis_reason") for b in batch_results if b["summary"].get("crisis_reason")),
             None,
@@ -143,13 +136,7 @@ class SentimentAnalyzer:
             },
         }
 
-    # ── PUBLIC ────────────────────────────────────────────────────────────────
-
     def analyze(self, comments: list, profile_name: str) -> dict:
-        """
-        Analisa uma lista de comentários e retorna o relatório completo.
-        Processa em batches para não estourar o contexto.
-        """
         if not comments:
             return {
                 "sentiments": [],
@@ -163,7 +150,6 @@ class SentimentAnalyzer:
                 },
             }
 
-        # Divide em batches
         batches = [
             comments[i: i + BATCH_SIZE]
             for i in range(0, len(comments), BATCH_SIZE)
