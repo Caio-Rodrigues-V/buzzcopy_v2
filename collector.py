@@ -129,7 +129,7 @@ class YouTubeCollector:
         print(f"[YouTube] {len(videos)} vídeos nos últimos {days} dias")
 
         all_comments = []
-        for video in videos[:5]:          # máx 10 vídeos para poupar quota
+        for video in videos[:3]:         # máx 10 vídeos para poupar quota
             comments = self.get_video_comments(video["video_id"])
             for c in comments:
                 c["video_title"] = video["title"]
