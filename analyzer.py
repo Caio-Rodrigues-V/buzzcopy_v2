@@ -1,80 +1,165 @@
 """
-analyzer.py — Análise de sentimento e geração de relatório via Claude API
+analyzer.py — Análise de sentimento híbrida:
+  - HuggingFace: classifica sentimento comentário por comentário (grátis)
+  - Claude: gera narrative, temas, crisis_alert e quotes (onde realmente brilha)
 """
 
+import os
 import json
 import anthropic
+from huggingface_hub import InferenceClient
 from json_repair import repair_json
 
-MODEL = "claude-haiku-4-5-20251001"
-BATCH_SIZE = 50
+MODEL_HF     = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
+MODEL_CLAUDE = "claude-haiku-4-5-20251001"
 
 
-PROMPT_TEMPLATE = """\
+# ── PARTE 1: HUGGING FACE ─────────────────────────────────────────────────────
+
+class SentimentClassifier:
+
+    def __init__(self, hf_token: str):
+        self.client = InferenceClient(
+            provider="hf-inference",
+            api_key=hf_token,
+        )
+
+    def classify(self, text: str) -> dict:
+        """Classifica um único comentário."""
+        try:
+            result = self.client.text_classification(
+                text[:512],
+                model=MODEL_HF,
+            )
+            top = result[0]
+            return {
+                "label": top.label.lower(),
+                "score": round(top.score, 3),
+            }
+        except Exception as e:
+            print(f"[HF] Erro ao classificar: {e}")
+            return {"label": "neutral", "score": 0.5}
+
+    def classify_batch(self, comments: list) -> list:
+        """Classifica uma lista inteira de comentários."""
+        results = []
+        for i, comment in enumerate(comments):
+            print(f"[HF] Classificando {i+1}/{len(comments)}")
+            sentiment = self.classify(comment["text"])
+            results.append({
+                "comment_id": comment["comment_id"],
+                "text":       comment["text"],
+                "label":      sentiment["label"],
+                "score":      sentiment["score"],
+            })
+        return results
+
+
+# ── PARTE 2: AGREGAÇÃO ────────────────────────────────────────────────────────
+
+def _aggregate(classified: list) -> dict:
+    """
+    Agrega os resultados do HuggingFace:
+    - Calcula percentuais
+    - Calcula overall_score (-1 a 1)
+    - Separa top comentários positivos e negativos
+    """
+    total = len(classified) or 1
+
+    positives = [c for c in classified if c["label"] == "positive"]
+    negatives = [c for c in classified if c["label"] == "negative"]
+    neutrals  = [c for c in classified if c["label"] == "neutral"]
+
+    pos_pct = round(len(positives) / total * 100, 1)
+    neg_pct = round(len(negatives) / total * 100, 1)
+    neu_pct = round(len(neutrals)  / total * 100, 1)
+
+    score_map = {"positive": 1, "neutral": 0, "negative": -1}
+    overall = sum(score_map[c["label"]] * c["score"] for c in classified) / total
+    overall = round(overall, 3)
+
+    top_pos = sorted(positives, key=lambda x: x["score"], reverse=True)[:5]
+    top_neg = sorted(negatives, key=lambda x: x["score"], reverse=True)[:5]
+
+    return {
+        "positive_pct":  pos_pct,
+        "negative_pct":  neg_pct,
+        "neutral_pct":   neu_pct,
+        "overall_score": overall,
+        "total":         total,
+        "top_positives": [c["text"] for c in top_pos],
+        "top_negatives": [c["text"] for c in top_neg],
+    }
+
+
+# ── PARTE 3: CLAUDE ───────────────────────────────────────────────────────────
+
+PROMPT_CLAUDE = """\
 Você é um analista de reputação política especializado em redes sociais brasileiras.
 
-Analise os comentários do YouTube abaixo referentes ao político/perfil indicado.
+Com base nos dados de sentimento abaixo, gere um relatório executivo.
 Retorne SOMENTE um JSON válido, sem texto extra, markdown ou explicação.
 
 Estrutura esperada:
 {{
-  "sentiments": [
-    {{"id": "comment_id", "sentiment": "positive|negative|neutral", "score": 0.85}}
-  ],
-  "summary": {{
-    "positive_pct":       45.0,
-    "negative_pct":       35.0,
-    "neutral_pct":        20.0,
-    "overall_score":      0.1,
-    "main_themes":        ["tema1", "tema2", "tema3"],
-    "crisis_alert":       false,
-    "crisis_reason":      null,
-    "top_positive_quote": "trecho positivo representativo",
-    "top_negative_quote": "trecho negativo representativo",
-    "narrative":          "Resumo executivo em 2-3 frases sobre o sentimento geral do período."
-  }}
+  "main_themes":        ["tema1", "tema2", "tema3"],
+  "crisis_alert":       false,
+  "crisis_reason":      null,
+  "top_positive_quote": "comentário positivo mais representativo",
+  "top_negative_quote": "comentário negativo mais representativo",
+  "narrative":          "Resumo executivo em 2-3 frases para um assessor político."
 }}
 
 Regras:
-- score vai de -1.0 (muito negativo) a 1.0 (muito positivo)
-- overall_score é a média ponderada de todos os comentários
-- crisis_alert = true se houver ataque coordenado, escândalo ou sentimento negativo > 60%
+- crisis_alert = true se sentimento negativo > 60% ou houver ataque coordenado
 - main_themes: os 3-5 temas mais recorrentes nos comentários
-- narrative: escreva em português, de forma executiva, para um assessor político
+- narrative: em português, tom executivo, para assessoria política
 
-PERFIL MONITORADO: {profile_name}
+PERFIL: {profile_name}
 
-COMENTÁRIOS ({total} comentários):
-{comments}
+DADOS DE SENTIMENTO:
+- Positivo: {positive_pct}%
+- Neutro:   {neutral_pct}%
+- Negativo: {negative_pct}%
+- Score geral: {overall_score}
+- Total de comentários: {total}
+
+COMENTÁRIOS MAIS POSITIVOS:
+{top_positives}
+
+COMENTÁRIOS MAIS NEGATIVOS:
+{top_negatives}
 """
 
 
-class SentimentAnalyzer:
+class NarrativeGenerator:
 
     def __init__(self, api_key: str):
         self.client = anthropic.Anthropic(api_key=api_key)
 
-    def _analyze_batch(self, comments: list, profile_name: str) -> dict:
-        comments_text = "\n".join(
-            f"[{c['comment_id']}] {c['text']}"
-            for c in comments
-        )
-
-        prompt = PROMPT_TEMPLATE.format(
+    def generate(self, aggregated: dict, profile_name: str) -> dict:
+        """Manda os dados agregados pro Claude e recebe o relatório narrativo."""
+        prompt = PROMPT_CLAUDE.format(
             profile_name=profile_name,
-            total=len(comments),
-            comments=comments_text,
+            positive_pct=aggregated["positive_pct"],
+            neutral_pct=aggregated["neutral_pct"],
+            negative_pct=aggregated["negative_pct"],
+            overall_score=aggregated["overall_score"],
+            total=aggregated["total"],
+            top_positives="\n".join(f"- {t}" for t in aggregated["top_positives"]) or "Nenhum",
+            top_negatives="\n".join(f"- {t}" for t in aggregated["top_negatives"]) or "Nenhum",
         )
 
         response = self.client.messages.create(
-            model=MODEL,
-            max_tokens=8096,
+            model=MODEL_CLAUDE,
+            max_tokens=2048,
             messages=[{"role": "user", "content": prompt}],
         )
 
         raw = response.content[0].text.strip()
+        print(f"[Claude RAW] {raw[:300]}")
 
-        # Remove blocos markdown
+        # Remove markdown se vier
         if "```" in raw:
             parts = raw.split("```")
             for part in parts:
@@ -85,63 +170,31 @@ class SentimentAnalyzer:
                     raw = part
                     break
 
-        # Extrai só o JSON ignorando texto antes/depois
+        # Extrai só o JSON
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start != -1 and end > start:
             raw = raw[start:end]
 
-        fixed = repair_json(raw)
-        print(f"[Claude RAW] {raw[:500]}")
-        result = json.loads(fixed)
-        print(f"[Claude KEYS] {list(result.keys())}")
-        return result
+        return json.loads(repair_json(raw))
 
-    def _merge_batches(self, batch_results: list, total_comments: int) -> dict:
-        all_sentiments = []
-        for b in batch_results:
-            all_sentiments.extend(b.get("sentiments", []))
 
-        pos = sum(1 for s in all_sentiments if s["sentiment"] == "positive")
-        neg = sum(1 for s in all_sentiments if s["sentiment"] == "negative")
-        neu = sum(1 for s in all_sentiments if s["sentiment"] == "neutral")
-        total = len(all_sentiments) or 1
-        overall = sum(s["score"] for s in all_sentiments) / total
+# ── PARTE 4: ORQUESTRADOR PRINCIPAL ──────────────────────────────────────────
 
-        all_themes = []
-        for b in batch_results:
-            all_themes.extend(b["summary"].get("main_themes", []))
-        seen, unique_themes = set(), []
-        for t in all_themes:
-            if t.lower() not in seen:
-                seen.add(t.lower())
-                unique_themes.append(t)
+class SentimentAnalyzer:
 
-        crisis_alert = any(b["summary"].get("crisis_alert") for b in batch_results)
-        crisis_reason = next(
-            (b["summary"].get("crisis_reason") for b in batch_results if b["summary"].get("crisis_reason")),
-            None,
-        )
-        narrative = batch_results[-1]["summary"].get("narrative", "")
-
-        return {
-            "sentiments": all_sentiments,
-            "summary": {
-                "positive_pct":       round(pos / total * 100, 1),
-                "negative_pct":       round(neg / total * 100, 1),
-                "neutral_pct":        round(neu / total * 100, 1),
-                "overall_score":      round(overall, 3),
-                "main_themes":        unique_themes[:5],
-                "crisis_alert":       crisis_alert,
-                "crisis_reason":      crisis_reason,
-                "top_positive_quote": batch_results[0]["summary"].get("top_positive_quote", ""),
-                "top_negative_quote": batch_results[0]["summary"].get("top_negative_quote", ""),
-                "narrative":          narrative,
-                "comments_analyzed":  len(all_sentiments),
-            },
-        }
+    def __init__(self, anthropic_key: str, hf_token: str):
+        self.classifier = SentimentClassifier(hf_token)
+        self.generator  = NarrativeGenerator(anthropic_key)
 
     def analyze(self, comments: list, profile_name: str) -> dict:
+        """
+        Pipeline completo:
+        1. HuggingFace classifica cada comentário
+        2. Agrega os resultados
+        3. Claude gera narrative, temas e crisis_alert
+        4. Retorna o relatório completo
+        """
         if not comments:
             return {
                 "sentiments": [],
@@ -155,20 +208,41 @@ class SentimentAnalyzer:
                 },
             }
 
-        batches = [
-            comments[i: i + BATCH_SIZE]
-            for i in range(0, len(comments), BATCH_SIZE)
+        # 1. HuggingFace classifica todos
+        print(f"[HF] Classificando {len(comments)} comentários...")
+        classified = self.classifier.classify_batch(comments)
+
+        # 2. Agrega os resultados
+        aggregated = _aggregate(classified)
+        print(f"[HF] Positivo: {aggregated['positive_pct']}% | Negativo: {aggregated['negative_pct']}% | Score: {aggregated['overall_score']}")
+
+        # 3. Claude gera o relatório narrativo
+        print(f"[Claude] Gerando relatório narrativo...")
+        narrative = self.generator.generate(aggregated, profile_name)
+
+        # 4. Monta o retorno final no mesmo formato de antes
+        sentiments = [
+            {
+                "id":        c["comment_id"],
+                "sentiment": c["label"],
+                "score":     c["score"] if c["label"] == "positive" else -c["score"] if c["label"] == "negative" else 0,
+            }
+            for c in classified
         ]
 
-        print(f"[Claude] Analisando {len(comments)} comentários em {len(batches)} batch(es)...")
-
-        results = []
-        for i, batch in enumerate(batches):
-            print(f"[Claude]  └─ Batch {i+1}/{len(batches)} ({len(batch)} comentários)")
-            result = self._analyze_batch(batch, profile_name)
-            results.append(result)
-
-        if len(results) == 1:
-            return results[0]
-
-        return self._merge_batches(results, len(comments))
+        return {
+            "sentiments": sentiments,
+            "summary": {
+                "positive_pct":       aggregated["positive_pct"],
+                "negative_pct":       aggregated["negative_pct"],
+                "neutral_pct":        aggregated["neutral_pct"],
+                "overall_score":      aggregated["overall_score"],
+                "main_themes":        narrative.get("main_themes", []),
+                "crisis_alert":       narrative.get("crisis_alert", False),
+                "crisis_reason":      narrative.get("crisis_reason", None),
+                "top_positive_quote": narrative.get("top_positive_quote", ""),
+                "top_negative_quote": narrative.get("top_negative_quote", ""),
+                "narrative":          narrative.get("narrative", ""),
+                "comments_analyzed":  aggregated["total"],
+            },
+        }
