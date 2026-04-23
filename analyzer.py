@@ -113,7 +113,7 @@ Estrutura esperada:
 Regras:
 - crisis_alert = true se sentimento negativo > 60% ou houver ataque coordenado
 - main_themes: os 3-5 temas mais recorrentes nos comentários
-- narrative: em português, tom executivo, para assessoria política
+- narrative: escreva em português, tom executivo. Use EXATAMENTE os percentuais fornecidos nos dados acima, não invente números diferentes.
 
 PERFIL: {profile_name}
 
