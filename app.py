@@ -31,7 +31,10 @@ def get_youtube() -> YouTubeCollector:
     return YouTubeCollector(os.environ["YOUTUBE_API_KEY"])
 
 def get_analyzer() -> SentimentAnalyzer:
-    return SentimentAnalyzer(os.environ["ANTHROPIC_API_KEY"])
+    return SentimentAnalyzer(
+        anthropic_key=os.environ["ANTHROPIC_API_KEY"],
+        hf_token=os.environ["HF_TOKEN"],
+    )
 
 def get_db() -> Client:
     return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
