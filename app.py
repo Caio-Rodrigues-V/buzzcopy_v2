@@ -207,6 +207,60 @@ def analyze_youtube(channel_id):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+@app.route("/analyze/instagram/<username>", methods=["POST"])
+def analyze_instagram(username):
+    """
+    Analisa sentimento das captions dos posts do Instagram.
+    Reutiliza o mesmo pipeline HuggingFace + Claude do YouTube.
+    """
+    try:
+        db = get_db()
+
+        # 1. Busca posts já coletados
+        result = (
+            db.table("instagram_posts")
+            .select("id, caption")
+            .eq("owner_username", username)
+            .not_.is_("caption", "null")
+            .order("posted_at", desc=True)
+            .limit(50)
+            .execute()
+        )
+
+        posts = result.data
+        if not posts:
+            return jsonify({"error": "Nenhum post coletado para este perfil."}), 404
+
+        # 2. Adapta pro formato que o analyzer espera
+        comments = [
+            {"comment_id": p["id"], "text": p["caption"]}
+            for p in posts if p.get("caption")
+        ]
+
+        # 3. Roda o mesmo pipeline
+        analyzer = get_analyzer()
+        analysis = analyzer.analyze(comments, username)
+
+        # 4. Atualiza sentiment em cada post
+        for s in analysis["sentiments"]:
+            db.table("instagram_posts").update({
+                "sentiment": s["sentiment"]
+            }).eq("id", s["id"]).execute()
+
+        # 5. Salva resumo geral
+        summary = analysis["summary"]
+        db.table("instagram_posts").update({
+            "ai_summary": summary["narrative"]
+        }).eq("owner_username", username).execute()
+
+        return jsonify({
+            "username":    username,
+            "posts_analyzed": summary["comments_analyzed"],
+            "summary":     summary,
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # ── INSTAGRAM ────────────────────────────────────────────────────────────────
 
 @app.route("/collect/instagram/<username>", methods=["POST"])
