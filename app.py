@@ -25,6 +25,7 @@ load_dotenv()
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+
 # ── CLIENTES ──────────────────────────────────────────────────────────────────
 
 def get_youtube() -> YouTubeCollector:
@@ -101,7 +102,6 @@ def collect_youtube(channel_id):
     """
     Coleta dados de um canal do YouTube e armazena no Supabase.
     Query params: days (default 30)
-    Chamado pelo N8n no agendamento diário.
     """
     days = int(request.args.get("days", 30))
 
@@ -110,7 +110,6 @@ def collect_youtube(channel_id):
         data      = collector.collect_full_profile(channel_id, days=days)
         db        = get_db()
 
-        # Salva snapshot do canal
         db.table("channel_snapshots").insert({
             "channel_id":       channel_id,
             "name":             data["channel"]["name"],
@@ -121,7 +120,6 @@ def collect_youtube(channel_id):
             "collected_at":     datetime.now(timezone.utc).isoformat(),
         }).execute()
 
-        # Salva vídeos (upsert por video_id)
         if data["videos"]:
             db.table("videos").upsert(
                 [{**v, "channel_id": channel_id} for v in data["videos"]],
@@ -139,28 +137,81 @@ def collect_youtube(channel_id):
         return jsonify({"error": str(e)}), 500
 
 
-# ── ANÁLISE ───────────────────────────────────────────────────────────────────
-@app.route("/instagram/posts/<username>", methods=["GET"])
-def get_instagram_posts(username):
-    """Retorna posts do Instagram já coletados no Supabase."""
-    limit = int(request.args.get("limit", 20))
+@app.route("/collect/instagram/<username>", methods=["POST"])
+def collect_instagram(username):
+    """
+    Coleta posts do Instagram via Apify e armazena no Supabase.
+    Query params: limit (default 10)
+    """
+    limit = int(request.args.get("limit", 10))
+
     try:
+        import requests as req
+
+        apify_token = os.environ["APIFY_TOKEN"]
+        url = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={apify_token}"
+
+        payload = {
+            "directUrls": [f"https://www.instagram.com/{username}/"],
+            "resultsType": "posts",
+            "resultsLimit": limit,
+        }
+
+        response = req.post(url, json=payload, timeout=120)
+        posts = response.json()
+
+        if not isinstance(posts, list):
+            return jsonify({"error": "Resposta inesperada do Apify", "raw": posts}), 500
+
         db = get_db()
-        result = (
-            db.table("instagram_posts")
-            .select("*")
-            .eq("owner_username", username)
-            .order("posted_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return jsonify({"username": username, "posts": result.data})
+
+        try:
+            profile = (
+                db.table("profiles")
+                .select("id")
+                .eq("platform", "instagram")
+                .eq("platform_id", username)
+                .execute()
+            )
+            profile_id = profile.data[0]["id"] if profile.data else None
+        except Exception:
+            profile_id = None
+
+        rows = []
+        for post in posts:
+            rows.append({
+                "id":               post.get("id"),
+                "profile_id":       profile_id,
+                "owner_username":   post.get("ownerUsername"),
+                "caption":          post.get("caption"),
+                "post_type":        post.get("type"),
+                "likes_count":      post.get("likesCount"),
+                "comments_count":   post.get("commentsCount"),
+                "video_view_count": post.get("videoViewCount"),
+                "url":              post.get("url"),
+                "hashtags":         post.get("hashtags", []),
+                "posted_at":        post.get("timestamp"),
+            })
+
+        if rows:
+            db.table("instagram_posts").upsert(rows, on_conflict="id").execute()
+
+        return jsonify({
+            "username":    username,
+            "posts_saved": len(rows),
+            "profile_id":  profile_id,
+        })
+
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+# ── ANÁLISE ───────────────────────────────────────────────────────────────────
+
 @app.route("/analyze/youtube/<channel_id>", methods=["POST"])
 def analyze_youtube(channel_id):
     """
-    Coleta + analisa sentimento de um canal em uma única chamada.
+    Coleta + analisa sentimento de um canal do YouTube.
     Salva o relatório no Supabase.
     Query params: days (default 30)
     """
@@ -168,15 +219,12 @@ def analyze_youtube(channel_id):
     profile_name = request.args.get("name", channel_id)
 
     try:
-        # 1. Coleta
         collector = get_youtube()
         data      = collector.collect_full_profile(channel_id, days=days)
 
-        # 2. Análise
         analyzer = get_analyzer()
         analysis = analyzer.analyze(data["comments"], profile_name)
 
-        # 3. Salva relatório
         db = get_db()
         report = {
             "channel_id":           channel_id,
@@ -207,6 +255,8 @@ def analyze_youtube(channel_id):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 @app.route("/analyze/instagram/<username>", methods=["POST"])
 def analyze_instagram(username):
     """
@@ -216,7 +266,6 @@ def analyze_instagram(username):
     try:
         db = get_db()
 
-        # 1. Busca posts já coletados
         result = (
             db.table("instagram_posts")
             .select("id, caption")
@@ -231,115 +280,61 @@ def analyze_instagram(username):
         if not posts:
             return jsonify({"error": "Nenhum post coletado para este perfil."}), 404
 
-        # 2. Adapta pro formato que o analyzer espera
         comments = [
             {"comment_id": p["id"], "text": p["caption"]}
             for p in posts if p.get("caption")
         ]
 
-        # 3. Roda o mesmo pipeline
         analyzer = get_analyzer()
         analysis = analyzer.analyze(comments, username)
 
-        # 4. Atualiza sentiment em cada post
         for s in analysis["sentiments"]:
             db.table("instagram_posts").update({
                 "sentiment": s["sentiment"]
             }).eq("id", s["id"]).execute()
 
-        # 5. Salva resumo geral
         summary = analysis["summary"]
         db.table("instagram_posts").update({
             "ai_summary": summary["narrative"]
         }).eq("owner_username", username).execute()
 
         return jsonify({
-            "username":    username,
+            "username":       username,
             "posts_analyzed": summary["comments_analyzed"],
-            "summary":     summary,
+            "summary":        summary,
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-# ── INSTAGRAM ────────────────────────────────────────────────────────────────
 
-@app.route("/collect/instagram/<username>", methods=["POST"])
-def collect_instagram(username):
-    """
-    Coleta posts do Instagram via Apify e armazena no Supabase.
-    Query params: limit (default 10)
-    """
-    limit = int(request.args.get("limit", 10))
 
+# ── LEITURA INSTAGRAM ─────────────────────────────────────────────────────────
+
+@app.route("/instagram/posts/<username>", methods=["GET"])
+def get_instagram_posts(username):
+    """Retorna posts do Instagram já coletados no Supabase."""
+    limit = int(request.args.get("limit", 20))
     try:
-        import requests as req
-
-        apify_token = os.environ["APIFY_TOKEN"]
-        url = f"https://api.apify.com/v2/acts/apify~instagram-scraper/run-sync-get-dataset-items?token={apify_token}"
-
-        payload = {
-            "directUrls": [f"https://www.instagram.com/{username}/"],
-            "resultsType": "posts",
-            "resultsLimit": limit,
-        }
-
-        response = req.post(url, json=payload, timeout=120)
-        posts = response.json()
-
-        if not isinstance(posts, list):
-            return jsonify({"error": "Resposta inesperada do Apify", "raw": posts}), 500
-
         db = get_db()
-
-        # Busca profile_id correspondente
-        profile = (
-            db.table("profiles")
-            .select("id")
-            .eq("platform", "instagram")
-            .eq("platform_id", username)
-            .single()
+        result = (
+            db.table("instagram_posts")
+            .select("*")
+            .eq("owner_username", username)
+            .order("posted_at", desc=True)
+            .limit(limit)
             .execute()
         )
-        profile_id = profile.data["id"] if profile.data else None
-
-        rows = []
-        for post in posts:
-            rows.append({
-                "id":               post.get("id"),
-                "profile_id":       profile_id,
-                "owner_username":   post.get("ownerUsername"),
-                "caption":          post.get("caption"),
-                "post_type":        post.get("type"),
-                "likes_count":      post.get("likesCount"),
-                "comments_count":   post.get("commentsCount"),
-                "video_view_count": post.get("videoViewCount"),
-                "url":              post.get("url"),
-                "hashtags":         post.get("hashtags", []),
-                "posted_at":        post.get("timestamp"),
-            })
-
-        if rows:
-            db.table("instagram_posts").upsert(rows, on_conflict="id").execute()
-
-        return jsonify({
-            "username":      username,
-            "posts_saved":   len(rows),
-            "profile_id":    profile_id,
-        })
-
+        return jsonify({"username": username, "posts": result.data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 # ── RELATÓRIOS ────────────────────────────────────────────────────────────────
 
 @app.route("/reports/<channel_id>", methods=["GET"])
 def get_reports(channel_id):
-    """
-    Retorna histórico de relatórios de um canal.
-    Query params: limit (default 10)
-    """
+    """Retorna histórico de relatórios de um canal YouTube."""
     limit = int(request.args.get("limit", 10))
-
     try:
         db = get_db()
         result = (
@@ -357,10 +352,7 @@ def get_reports(channel_id):
 
 @app.route("/reports/latest", methods=["GET"])
 def get_all_latest():
-    """
-    Retorna o relatório mais recente de cada canal.
-    Útil para o dashboard mostrar visão geral de todos os perfis.
-    """
+    """Retorna o relatório mais recente de cada canal."""
     try:
         db = get_db()
         result = (
@@ -371,7 +363,6 @@ def get_all_latest():
             .execute()
         )
 
-        # Pega somente o mais recente por canal
         seen, latest = set(), []
         for r in result.data:
             if r["channel_id"] not in seen:
