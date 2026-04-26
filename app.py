@@ -140,7 +140,23 @@ def collect_youtube(channel_id):
 
 
 # ── ANÁLISE ───────────────────────────────────────────────────────────────────
-
+@app.route("/instagram/posts/<username>", methods=["GET"])
+def get_instagram_posts(username):
+    """Retorna posts do Instagram já coletados no Supabase."""
+    limit = int(request.args.get("limit", 20))
+    try:
+        db = get_db()
+        result = (
+            db.table("instagram_posts")
+            .select("*")
+            .eq("owner_username", username)
+            .order("posted_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return jsonify({"username": username, "posts": result.data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 @app.route("/analyze/youtube/<channel_id>", methods=["POST"])
 def analyze_youtube(channel_id):
     """
