@@ -141,9 +141,9 @@ def collect_youtube(channel_id):
 def collect_instagram(username):
     """
     Coleta posts do Instagram via Apify e armazena no Supabase.
-    Query params: limit (default 10)
+    Query params: limit (default 50)
     """
-    limit = int(request.args.get("limit", 10))
+    limit = int(request.args.get("limit", 50))
 
     try:
         import requests as req
