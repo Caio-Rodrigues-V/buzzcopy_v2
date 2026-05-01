@@ -456,7 +456,22 @@ def get_instagram_posts(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-
+@app.route("/instagram/comments/<username>", methods=["GET"])
+def get_comment_analysis(username):
+    """Retorna comentários e análise do Instagram."""
+    try:
+        db = get_db()
+        result = (
+            db.table("instagram_comments")
+            .select("*")
+            .eq("owner_username", username)
+            .order("likes_count", desc=True)
+            .limit(50)
+            .execute()
+        )
+        return jsonify({"username": username, "comments": result.data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # ── RELATÓRIOS ────────────────────────────────────────────────────────────────
 
 @app.route("/reports/<channel_id>", methods=["GET"])
