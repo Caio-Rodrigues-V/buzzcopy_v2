@@ -216,6 +216,79 @@ def collect_instagram(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/collect/comments/<username>", methods=["POST"])
+def collect_comments(username):
+    """
+    Coleta comentários dos posts do Instagram via Apify.
+    Query params: posts_limit (quantos posts buscar, default 10), comments_per_post (default 20)
+    """
+    posts_limit = int(request.args.get("posts_limit", 10))
+    comments_per_post = int(request.args.get("comments_per_post", 20))
+
+    try:
+        import requests as req
+
+        db = get_db()
+
+        # Busca as URLs dos posts já coletados
+        result = (
+            db.table("instagram_posts")
+            .select("id, url")
+            .eq("owner_username", username)
+            .not_.is_("url", "null")
+            .order("posted_at", desc=True)
+            .limit(posts_limit)
+            .execute()
+        )
+
+        posts = result.data
+        if not posts:
+            return jsonify({"error": "Nenhum post coletado para este perfil."}), 404
+
+        urls = [p["url"] for p in posts if p.get("url")]
+        post_url_map = {p["url"]: p["id"] for p in posts}
+
+        # Chama o Apify comment scraper
+        apify_token = os.environ["APIFY_TOKEN"]
+        url = f"https://api.apify.com/v2/acts/apify~instagram-comment-scraper/run-sync-get-dataset-items?token={apify_token}"
+
+        payload = {
+            "directUrls": urls,
+            "resultsLimit": comments_per_post,
+        }
+
+        response = req.post(url, json=payload, timeout=300)
+        comments = response.json()
+
+        if not isinstance(comments, list):
+            return jsonify({"error": "Resposta inesperada do Apify", "raw": comments}), 500
+
+        rows = []
+        for c in comments:
+            post_url = c.get("postUrl") or c.get("url", "")
+            post_id = post_url_map.get(post_url)
+            rows.append({
+                "id":                 str(c.get("id")),
+                "post_id":            post_id,
+                "owner_username":     username,
+                "post_url":           post_url,
+                "text":               c.get("text"),
+                "likes_count":        c.get("likesCount", 0),
+                "timestamp":          c.get("timestamp"),
+                "commenter_username": c.get("ownerUsername"),
+            })
+
+        if rows:
+            db.table("instagram_comments").upsert(rows, on_conflict="id").execute()
+
+        return jsonify({
+            "username":         username,
+            "posts_scraped":    len(urls),
+            "comments_saved":   len(rows),
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ── ANÁLISE ───────────────────────────────────────────────────────────────────
 
