@@ -24,11 +24,12 @@ class SentimentClassifier:
             api_key=hf_token,
         )
 
-    def classify(self, text: str) -> dict:
-        """Classifica um único comentário."""
+    def classify(self, text: str, profile_name: str = '') -> dict:
+        """Classifica um único comentário com contexto do perfil."""
         try:
+            contextualized = f"Opinião sobre {profile_name}: {text}" if profile_name else text
             result = self.client.text_classification(
-                text[:512],
+                contextualized[:512],
                 model=MODEL_HF,
             )
             top = result[0]
@@ -40,12 +41,12 @@ class SentimentClassifier:
             print(f"[HF] Erro ao classificar: {e}")
             return {"label": "neutral", "score": 0.5}
 
-    def classify_batch(self, comments: list) -> list:
+    def classify_batch(self, comments: list, profile_name: str = '') -> list:
         """Classifica uma lista inteira de comentários."""
         results = []
         for i, comment in enumerate(comments):
             print(f"[HF] Classificando {i+1}/{len(comments)}")
-            sentiment = self.classify(comment["text"])
+            sentiment = self.classify(comment["text"], profile_name)
             results.append({
                 "comment_id": comment["comment_id"],
                 "text":       comment["text"],
@@ -58,12 +59,6 @@ class SentimentClassifier:
 # ── PARTE 2: AGREGAÇÃO ────────────────────────────────────────────────────────
 
 def _aggregate(classified: list) -> dict:
-    """
-    Agrega os resultados do HuggingFace:
-    - Calcula percentuais
-    - Calcula overall_score (-1 a 1)
-    - Separa top comentários positivos e negativos
-    """
     total = len(classified) or 1
 
     positives = [c for c in classified if c["label"] == "positive"]
@@ -113,7 +108,10 @@ Estrutura esperada:
 Regras:
 - crisis_alert = true se sentimento negativo > 60% ou houver ataque coordenado
 - main_themes: os 3-5 temas mais recorrentes nos comentários
-- narrative: escreva em português, tom executivo. Use EXATAMENTE os percentuais fornecidos nos dados acima, não invente números diferentes.
+- narrative: escreva em português, tom executivo. Use EXATAMENTE os percentuais fornecidos.
+- CRÍTICO: Analise o sentimento direcionado ESPECIFICAMENTE ao perfil "{profile_name}".
+  Ignore opiniões sobre temas, assuntos ou terceiros mencionados nos textos.
+  Se o texto expressa opinião sobre um assunto mas não sobre {profile_name}, considere neutro.
 
 PERFIL: {profile_name}
 
@@ -138,7 +136,6 @@ class NarrativeGenerator:
         self.client = anthropic.Anthropic(api_key=api_key)
 
     def generate(self, aggregated: dict, profile_name: str) -> dict:
-        """Manda os dados agregados pro Claude e recebe o relatório narrativo."""
         prompt = PROMPT_CLAUDE.format(
             profile_name=profile_name,
             positive_pct=aggregated["positive_pct"],
@@ -159,7 +156,6 @@ class NarrativeGenerator:
         raw = response.content[0].text.strip()
         print(f"[Claude RAW] {raw[:300]}")
 
-        # Remove markdown se vier
         if "```" in raw:
             parts = raw.split("```")
             for part in parts:
@@ -170,7 +166,6 @@ class NarrativeGenerator:
                     raw = part
                     break
 
-        # Extrai só o JSON
         start = raw.find("{")
         end = raw.rfind("}") + 1
         if start != -1 and end > start:
@@ -188,13 +183,6 @@ class SentimentAnalyzer:
         self.generator  = NarrativeGenerator(anthropic_key)
 
     def analyze(self, comments: list, profile_name: str) -> dict:
-        """
-        Pipeline completo:
-        1. HuggingFace classifica cada comentário
-        2. Agrega os resultados
-        3. Claude gera narrative, temas e crisis_alert
-        4. Retorna o relatório completo
-        """
         if not comments:
             return {
                 "sentiments": [],
@@ -208,19 +196,15 @@ class SentimentAnalyzer:
                 },
             }
 
-        # 1. HuggingFace classifica todos
-        print(f"[HF] Classificando {len(comments)} comentários...")
-        classified = self.classifier.classify_batch(comments)
+        print(f"[HF] Classificando {len(comments)} comentários para perfil: {profile_name}")
+        classified = self.classifier.classify_batch(comments, profile_name)
 
-        # 2. Agrega os resultados
         aggregated = _aggregate(classified)
         print(f"[HF] Positivo: {aggregated['positive_pct']}% | Negativo: {aggregated['negative_pct']}% | Score: {aggregated['overall_score']}")
 
-        # 3. Claude gera o relatório narrativo
         print(f"[Claude] Gerando relatório narrativo...")
         narrative = self.generator.generate(aggregated, profile_name)
 
-        # 4. Monta o retorno final no mesmo formato de antes
         sentiments = [
             {
                 "id":        c["comment_id"],
