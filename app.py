@@ -86,9 +86,11 @@ def add_profile():
 
 @app.route("/profiles/<profile_id>", methods=["DELETE"])
 def delete_profile(profile_id):
-    """Remove um perfil do monitoramento."""
     try:
         db = get_db()
+        # Primeiro deleta os posts vinculados
+        db.table("instagram_posts").delete().eq("profile_id", profile_id).execute()
+        # Depois deleta o perfil
         db.table("profiles").delete().eq("id", profile_id).execute()
         return jsonify({"deleted": profile_id})
     except Exception as e:
