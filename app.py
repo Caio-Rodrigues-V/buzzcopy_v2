@@ -95,6 +95,7 @@ def delete_profile(profile_id):
 
         # Deleta posts por profile_id E por username
         if username:
+            db.table("instagram_comments").delete().eq("owner_username", username).execute()  # ← novo
             db.table("instagram_posts").delete().eq("owner_username", username).execute()
         db.table("instagram_posts").delete().eq("profile_id", profile_id).execute()
 
@@ -391,7 +392,50 @@ def analyze_instagram(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/analyze/comments/<username>", methods=["POST"])
+def analyze_comments(username):
+    """
+    Analisa sentimento dos comentários do Instagram via Claude.
+    """
+    try:
+        db = get_db()
 
+        result = (
+            db.table("instagram_comments")
+            .select("id, text")
+            .eq("owner_username", username)
+            .not_.is_("text", "null")
+            .order("likes_count", desc=True)
+            .limit(100)
+            .execute()
+        )
+
+        comments = result.data
+        if not comments:
+            return jsonify({"error": "Nenhum comentário coletado para este perfil."}), 404
+
+        formatted = [
+            {"comment_id": c["id"], "text": c["text"]}
+            for c in comments if c.get("text")
+        ]
+
+        analyzer = get_analyzer()
+        analysis = analyzer.analyze(formatted, username)
+
+        for s in analysis["sentiments"]:
+            db.table("instagram_comments").update({
+                "sentiment": s["sentiment"]
+            }).eq("id", s["id"]).execute()
+
+        return jsonify({
+            "username":          username,
+            "comments_analyzed": analysis["summary"]["comments_analyzed"],
+            "summary":           analysis["summary"],
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    
 # ── LEITURA INSTAGRAM ─────────────────────────────────────────────────────────
 
 @app.route("/instagram/posts/<username>", methods=["GET"])
