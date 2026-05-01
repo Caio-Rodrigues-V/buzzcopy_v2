@@ -88,10 +88,19 @@ def add_profile():
 def delete_profile(profile_id):
     try:
         db = get_db()
-        # Primeiro deleta os posts vinculados
+
+        # Busca o username antes de deletar
+        profile = db.table("profiles").select("platform_id").eq("id", profile_id).execute()
+        username = profile.data[0]["platform_id"] if profile.data else None
+
+        # Deleta posts por profile_id E por username
+        if username:
+            db.table("instagram_posts").delete().eq("owner_username", username).execute()
         db.table("instagram_posts").delete().eq("profile_id", profile_id).execute()
-        # Depois deleta o perfil
+
+        # Deleta o perfil
         db.table("profiles").delete().eq("id", profile_id).execute()
+
         return jsonify({"deleted": profile_id})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
