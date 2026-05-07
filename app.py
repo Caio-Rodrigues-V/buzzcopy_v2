@@ -436,6 +436,77 @@ def analyze_comments(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
     
+# ── BUSCA DE MENÇÕES ──────────────────────────────────────────────────────────
+
+@app.route("/search/mentions", methods=["GET"])
+def search_mentions():
+    """
+    Busca menções públicas de um termo em jornais, portais e blogs.
+    Query params: q (termo de busca), limit (default 10)
+    """
+    query = request.args.get("q", "").strip()
+    limit = int(request.args.get("limit", 10))
+
+    if not query:
+        return jsonify({"error": "Parâmetro 'q' é obrigatório"}), 400
+
+    try:
+        import requests as req
+
+        api_key = os.environ["GOOGLE_SEARCH_API_KEY"]
+        cx      = os.environ["GOOGLE_SEARCH_CX"]
+
+        url = "https://www.googleapis.com/customsearch/v1"
+        params = {
+            "key": api_key,
+            "cx":  cx,
+            "q":   query,
+            "num": min(limit, 10),
+            "lr":  "lang_pt",
+            "dateRestrict": "d7",  # últimos 7 dias
+        }
+
+        response = req.get(url, params=params, timeout=15)
+        data = response.json()
+
+        if "error" in data:
+            return jsonify({"error": data["error"]["message"]}), 500
+
+        items = data.get("items", [])
+
+        mentions = []
+        for item in items:
+            mentions.append({
+                "title":   item.get("title"),
+                "source":  item.get("displayLink"),
+                "url":     item.get("link"),
+                "snippet": item.get("snippet"),
+                "date":    item.get("pagemap", {}).get("metatags", [{}])[0].get("article:published_time"),
+            })
+
+        # Claude analisa sentimento de cada menção
+        if mentions:
+            analyzer = get_analyzer()
+            formatted = [
+                {"comment_id": str(i), "text": f"{m['title']}. {m['snippet']}"}
+                for i, m in enumerate(mentions)
+            ]
+            analysis = analyzer.analyze(formatted, query)
+
+            for i, s in enumerate(analysis["sentiments"]):
+                if i < len(mentions):
+                    mentions[i]["sentiment"] = s["sentiment"]
+                    mentions[i]["score"]     = s["score"]
+
+        return jsonify({
+            "query":    query,
+            "total":    len(mentions),
+            "mentions": mentions,
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+        
 # ── LEITURA INSTAGRAM ─────────────────────────────────────────────────────────
 
 @app.route("/instagram/posts/<username>", methods=["GET"])
