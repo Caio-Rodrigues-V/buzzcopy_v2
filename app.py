@@ -441,7 +441,7 @@ def analyze_comments(username):
 @app.route("/search/mentions", methods=["GET"])
 def search_mentions():
     """
-    Busca menções públicas de um termo em jornais, portais e blogs.
+    Busca menções públicas de um termo via SerpApi.
     Query params: q (termo de busca), limit (default 10)
     """
     query = request.args.get("q", "").strip()
@@ -453,38 +453,31 @@ def search_mentions():
     try:
         import requests as req
 
-        api_key = os.environ["GOOGLE_SEARCH_API_KEY"]
-        cx      = os.environ["GOOGLE_SEARCH_CX"]
+        response = req.get("https://serpapi.com/search", params={
+            "q":       query,
+            "api_key": os.environ["SERPAPI_KEY"],
+            "engine":  "google",
+            "hl":      "pt",
+            "gl":      "br",
+            "num":     min(limit, 10),
+            "tbs":     "qdr:w",  # últimos 7 dias
+        }, timeout=15)
 
-        url = "https://www.googleapis.com/customsearch/v1"
-        params = {
-            "key": api_key,
-            "cx":  cx,
-            "q":   query,
-            "num": min(limit, 10),
-            "lr":  "lang_pt",
-            "dateRestrict": "d7",  # últimos 7 dias
-        }
-
-        response = req.get(url, params=params, timeout=15)
         data = response.json()
 
         if "error" in data:
-            return jsonify({"error": data["error"]["message"]}), 500
-
-        items = data.get("items", [])
+            return jsonify({"error": data["error"]}), 500
 
         mentions = []
-        for item in items:
+        for item in data.get("organic_results", []):
             mentions.append({
                 "title":   item.get("title"),
-                "source":  item.get("displayLink"),
+                "source":  item.get("source") or item.get("displayed_link"),
                 "url":     item.get("link"),
                 "snippet": item.get("snippet"),
-                "date":    item.get("pagemap", {}).get("metatags", [{}])[0].get("article:published_time"),
+                "date":    item.get("date"),
             })
 
-        # Claude analisa sentimento de cada menção
         if mentions:
             analyzer = get_analyzer()
             formatted = [
@@ -492,7 +485,6 @@ def search_mentions():
                 for i, m in enumerate(mentions)
             ]
             analysis = analyzer.analyze(formatted, query)
-
             for i, s in enumerate(analysis["sentiments"]):
                 if i < len(mentions):
                     mentions[i]["sentiment"] = s["sentiment"]
