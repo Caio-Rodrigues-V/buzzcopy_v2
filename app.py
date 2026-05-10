@@ -2,13 +2,8 @@
 app.py — API Flask do Social Monitor MVP
 Endpoints chamados pelo N8n para coletar e analisar perfis políticos
 """
-from flask import request, jsonify
-from pulse_simulator import simular
-from supabase_client import supabase  # seu client supabase
-from datetime import datetime
-
-import uuid
 import os
+import uuid
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -18,14 +13,13 @@ from supabase import create_client, Client
 
 from collector import YouTubeCollector
 from analyzer import SentimentAnalyzer
+from pulse_simulator import simular
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 print("SUPABASE_URL =", os.getenv("SUPABASE_URL"))
 print("SUPABASE_KEY carregada =", bool(os.getenv("SUPABASE_KEY")))
-
-load_dotenv()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
@@ -50,7 +44,7 @@ def get_db() -> Client:
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "social-monitor-api", "version": "1.0.0"})
+    return jsonify({"status": "ok", "service": "social-monitor-api", "version": "1.1.0"})
 
 
 # ── PERFIS ────────────────────────────────────────────────────────────────────
@@ -100,7 +94,7 @@ def delete_profile(profile_id):
 
         # Deleta posts por profile_id E por username
         if username:
-            db.table("instagram_comments").delete().eq("owner_username", username).execute()  # ← novo
+            db.table("instagram_comments").delete().eq("owner_username", username).execute()
             db.table("instagram_posts").delete().eq("owner_username", username).execute()
         db.table("instagram_posts").delete().eq("profile_id", profile_id).execute()
 
@@ -222,6 +216,7 @@ def collect_instagram(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/collect/comments/<username>", methods=["POST"])
 def collect_comments(username):
     """
@@ -296,6 +291,7 @@ def collect_comments(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 # ── ANÁLISE ───────────────────────────────────────────────────────────────────
 
 @app.route("/analyze/youtube/<channel_id>", methods=["POST"])
@@ -346,60 +342,6 @@ def analyze_youtube(channel_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/simulate/scenario", methods=["POST"])
-def simulate_scenario():
-    """
-    Simula reação do eleitorado a um conteúdo político.
-
-    Body JSON:
-    {
-        "conteudo": "texto do post/fala a testar",
-        "n_agentes": 100,
-        "filtros": {"regiao": "nordeste"},   // opcional
-        "contexto": "candidato a prefeito",  // opcional
-        "username": "joaopolitico"           // opcional, pra associar ao perfil monitorado
-    }
-    """
-    data = request.get_json()
-    conteudo = data.get("conteudo", "").strip()
-
-    if not conteudo:
-        return jsonify({"erro": "Campo 'conteudo' é obrigatório."}), 400
-
-    n_agentes = min(int(data.get("n_agentes", 100)), 500)  # teto pra controle de custo
-    filtros = data.get("filtros")
-    contexto = data.get("contexto", "")
-    username = data.get("username")
-
-    forecast = simular(conteudo, n_agentes=n_agentes, filtros=filtros, contexto=contexto)
-
-    # Persiste no Supabase
-    sim_id = str(uuid.uuid4())
-    supabase.table("simulacoes").insert({
-        "id": sim_id,
-        "username": username,
-        "conteudo": conteudo,
-        "n_agentes": n_agentes,
-        "filtros": filtros,
-        "contexto": contexto,
-        "forecast": forecast,
-        "created_at": datetime.utcnow().isoformat(),
-    }).execute()
-
-    forecast["simulacao_id"] = sim_id
-    return jsonify(forecast)
-
-
-@app.route("/simulate/history/<username>", methods=["GET"])
-def simulate_history(username):
-    """Lista simulações anteriores do perfil."""
-    res = supabase.table("simulacoes") \
-        .select("*") \
-        .eq("username", username) \
-        .order("created_at", desc=True) \
-        .limit(20) \
-        .execute()
-    return jsonify(res.data)
 
 @app.route("/analyze/instagram/<username>", methods=["POST"])
 def analyze_instagram(username):
@@ -451,6 +393,7 @@ def analyze_instagram(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/analyze/comments/<username>", methods=["POST"])
 def analyze_comments(username):
     """
@@ -494,7 +437,97 @@ def analyze_comments(username):
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-    
+
+
+# ── SIMULADOR DE CENÁRIOS (MiroFish-inspired) ─────────────────────────────────
+
+@app.route("/simulate/scenario", methods=["POST"])
+def simulate_scenario():
+    """
+    Simula reação do eleitorado brasileiro a um conteúdo político.
+
+    Body JSON:
+    {
+        "conteudo": "texto do post/fala a testar",           // obrigatório
+        "n_agentes": 100,                                     // opcional, max 500
+        "filtros": {"regiao": "nordeste", "classe": "C"},     // opcional
+        "contexto": "candidato a prefeito em 2º turno",       // opcional
+        "username": "joaopolitico"                            // opcional
+    }
+    """
+    try:
+        data = request.get_json(force=True) or {}
+        conteudo = data.get("conteudo", "").strip()
+
+        if not conteudo:
+            return jsonify({"erro": "Campo 'conteudo' é obrigatório."}), 400
+
+        n_agentes = min(int(data.get("n_agentes", 100)), 500)
+        filtros = data.get("filtros")
+        contexto = data.get("contexto", "")
+        username = data.get("username")
+
+        # Roda a simulação multi-agente
+        forecast = simular(
+            conteudo,
+            n_agentes=n_agentes,
+            filtros=filtros,
+            contexto=contexto,
+        )
+
+        # Persiste no Supabase
+        sim_id = str(uuid.uuid4())
+        db = get_db()
+        db.table("simulacoes").insert({
+            "id":         sim_id,
+            "username":   username,
+            "conteudo":   conteudo,
+            "n_agentes":  n_agentes,
+            "filtros":    filtros,
+            "contexto":   contexto,
+            "forecast":   forecast,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        forecast["simulacao_id"] = sim_id
+        return jsonify(forecast)
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/simulate/history/<username>", methods=["GET"])
+def simulate_history(username):
+    """Lista simulações anteriores associadas a um perfil."""
+    limit = int(request.args.get("limit", 20))
+    try:
+        db = get_db()
+        res = (
+            db.table("simulacoes")
+            .select("*")
+            .eq("username", username)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return jsonify({"username": username, "simulations": res.data})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/simulate/<sim_id>", methods=["GET"])
+def get_simulation(sim_id):
+    """Recupera uma simulação específica pelo ID."""
+    try:
+        db = get_db()
+        res = db.table("simulacoes").select("*").eq("id", sim_id).limit(1).execute()
+        if not res.data:
+            return jsonify({"error": "Simulação não encontrada"}), 404
+        return jsonify(res.data[0])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ── BUSCA DE MENÇÕES ──────────────────────────────────────────────────────────
 
 @app.route("/search/mentions", methods=["GET"])
@@ -557,7 +590,8 @@ def search_mentions():
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-        
+
+
 # ── LEITURA INSTAGRAM ─────────────────────────────────────────────────────────
 
 @app.route("/instagram/posts/<username>", methods=["GET"])
@@ -578,6 +612,7 @@ def get_instagram_posts(username):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 @app.route("/instagram/comments/<username>", methods=["GET"])
 def get_comment_analysis(username):
     """Retorna comentários e análise do Instagram."""
@@ -594,6 +629,8 @@ def get_comment_analysis(username):
         return jsonify({"username": username, "comments": result.data})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
 # ── RELATÓRIOS ────────────────────────────────────────────────────────────────
 
 @app.route("/reports/<channel_id>", methods=["GET"])
