@@ -2,7 +2,12 @@
 app.py — API Flask do Social Monitor MVP
 Endpoints chamados pelo N8n para coletar e analisar perfis políticos
 """
+from flask import request, jsonify
+from pulse_simulator import simular
+from supabase_client import supabase  # seu client supabase
+from datetime import datetime
 
+import uuid
 import os
 from datetime import datetime, timezone
 
@@ -341,6 +346,60 @@ def analyze_youtube(channel_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/simulate/scenario", methods=["POST"])
+def simulate_scenario():
+    """
+    Simula reação do eleitorado a um conteúdo político.
+
+    Body JSON:
+    {
+        "conteudo": "texto do post/fala a testar",
+        "n_agentes": 100,
+        "filtros": {"regiao": "nordeste"},   // opcional
+        "contexto": "candidato a prefeito",  // opcional
+        "username": "joaopolitico"           // opcional, pra associar ao perfil monitorado
+    }
+    """
+    data = request.get_json()
+    conteudo = data.get("conteudo", "").strip()
+
+    if not conteudo:
+        return jsonify({"erro": "Campo 'conteudo' é obrigatório."}), 400
+
+    n_agentes = min(int(data.get("n_agentes", 100)), 500)  # teto pra controle de custo
+    filtros = data.get("filtros")
+    contexto = data.get("contexto", "")
+    username = data.get("username")
+
+    forecast = simular(conteudo, n_agentes=n_agentes, filtros=filtros, contexto=contexto)
+
+    # Persiste no Supabase
+    sim_id = str(uuid.uuid4())
+    supabase.table("simulacoes").insert({
+        "id": sim_id,
+        "username": username,
+        "conteudo": conteudo,
+        "n_agentes": n_agentes,
+        "filtros": filtros,
+        "contexto": contexto,
+        "forecast": forecast,
+        "created_at": datetime.utcnow().isoformat(),
+    }).execute()
+
+    forecast["simulacao_id"] = sim_id
+    return jsonify(forecast)
+
+
+@app.route("/simulate/history/<username>", methods=["GET"])
+def simulate_history(username):
+    """Lista simulações anteriores do perfil."""
+    res = supabase.table("simulacoes") \
+        .select("*") \
+        .eq("username", username) \
+        .order("created_at", desc=True) \
+        .limit(20) \
+        .execute()
+    return jsonify(res.data)
 
 @app.route("/analyze/instagram/<username>", methods=["POST"])
 def analyze_instagram(username):
