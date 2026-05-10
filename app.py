@@ -527,7 +527,279 @@ def get_simulation(sim_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ── WAR ROOM ─────────────────────────────────────────────────────────────────
 
+@app.route("/warroom/threat-level", methods=["GET"])
+def warroom_threat_level():
+    """
+    Calcula o threat level global (DEFCON) somando dados de todos os perfis ativos.
+    Considera:
+    - % comentários negativos nas últimas 24h
+    - Volume de comentários novos (pico anormal)
+    - Menções negativas na imprensa (SerpApi)
+    """
+    try:
+        from datetime import timedelta
+        db = get_db()
+        cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
+
+        # Perfis ativos
+        profiles_res = db.table("profiles").select("*").execute()
+        profiles = profiles_res.data or []
+
+        # ── Comentários das últimas 24h ──
+        recent_comments_res = (
+            db.table("instagram_comments")
+            .select("sentiment, owner_username, likes_count, timestamp")
+            .gte("timestamp", cutoff_24h)
+            .execute()
+        )
+        recent = recent_comments_res.data or []
+
+        # ── Comentários dos últimos 7d pra calcular baseline ──
+        baseline_res = (
+            db.table("instagram_comments")
+            .select("timestamp, owner_username")
+            .gte("timestamp", cutoff_7d)
+            .execute()
+        )
+        baseline = baseline_res.data or []
+
+        total_24h = len(recent)
+        total_7d = len(baseline) or 1
+        avg_daily = total_7d / 7
+
+        # Pico anormal: volume das últimas 24h > 1.5x média diária
+        spike_factor = total_24h / avg_daily if avg_daily > 0 else 0
+        has_spike = spike_factor > 1.5
+
+        # % negativo nas últimas 24h
+        analyzed = [c for c in recent if c.get("sentiment")]
+        neg_count = len([c for c in analyzed if c.get("sentiment") == "negative"])
+        neg_pct = (neg_count / len(analyzed) * 100) if analyzed else 0
+
+        # ── Threat Level (DEFCON) ──
+        # 5 = calmo, 1 = crise total
+        threat_score = 0
+        if neg_pct > 60: threat_score += 40
+        elif neg_pct > 40: threat_score += 25
+        elif neg_pct > 25: threat_score += 12
+
+        if has_spike: threat_score += 25
+        if spike_factor > 3: threat_score += 15  # pico extremo
+
+        # Perfis em crise individual
+        crisis_profiles_count = 0
+        per_profile = {}
+        for p in profiles:
+            if p["platform"] != "instagram":
+                continue
+            user = p["platform_id"]
+            user_comments = [c for c in analyzed if c.get("owner_username") == user]
+            if not user_comments:
+                continue
+            user_neg = len([c for c in user_comments if c["sentiment"] == "negative"])
+            user_neg_pct = (user_neg / len(user_comments)) * 100
+            per_profile[user] = {
+                "name": p["name"],
+                "username": user,
+                "neg_pct": round(user_neg_pct, 1),
+                "comments_24h": len(user_comments),
+                "in_crisis": user_neg_pct > 50,
+            }
+            if user_neg_pct > 50:
+                crisis_profiles_count += 1
+                threat_score += 10
+
+        threat_score = min(100, threat_score)
+
+        if threat_score >= 70: defcon = 1; label = "CRISIS ACTIVE"; color = "red"
+        elif threat_score >= 50: defcon = 2; label = "EMERGENCY"; color = "red"
+        elif threat_score >= 30: defcon = 3; label = "ELEVATED ALERT"; color = "amber"
+        elif threat_score >= 15: defcon = 4; label = "WATCH"; color = "amber"
+        else: defcon = 5; label = "ALL CLEAR"; color = "green"
+
+        return jsonify({
+            "defcon":               defcon,
+            "label":                label,
+            "color":                color,
+            "threat_score":         threat_score,
+            "negative_pct_24h":     round(neg_pct, 1),
+            "comments_24h":         total_24h,
+            "spike_factor":         round(spike_factor, 2),
+            "has_spike":            has_spike,
+            "crisis_profiles":      crisis_profiles_count,
+            "total_profiles":       len([p for p in profiles if p["platform"] == "instagram"]),
+            "per_profile":          per_profile,
+            "calculated_at":        datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/warroom/negative-feed", methods=["GET"])
+def warroom_negative_feed():
+    """
+    Feed de comentários negativos mais recentes/relevantes de TODOS os perfis.
+    Query params: limit (default 30), hours (default 24)
+    """
+    try:
+        from datetime import timedelta
+        limit = int(request.args.get("limit", 30))
+        hours = int(request.args.get("hours", 24))
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+
+        db = get_db()
+        res = (
+            db.table("instagram_comments")
+            .select("*")
+            .eq("sentiment", "negative")
+            .gte("timestamp", cutoff)
+            .order("likes_count", desc=True)
+            .limit(limit)
+            .execute()
+        )
+
+        comments = res.data or []
+
+        # Enriquece com nome do político (lookup profiles)
+        usernames = list(set(c.get("owner_username") for c in comments if c.get("owner_username")))
+        profiles_res = (
+            db.table("profiles")
+            .select("name, platform_id")
+            .in_("platform_id", usernames)
+            .execute() if usernames else None
+        )
+        name_map = {p["platform_id"]: p["name"] for p in (profiles_res.data if profiles_res else [])}
+
+        for c in comments:
+            c["politician_name"] = name_map.get(c.get("owner_username"), c.get("owner_username"))
+
+        return jsonify({"comments": comments, "total": len(comments)})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/warroom/generate-response", methods=["POST"])
+def warroom_generate_response():
+    """
+    Gera 3 respostas estratégicas a um ataque e simula cada uma.
+
+    Body JSON:
+    {
+        "attack": "texto do ataque/crítica que o político está sofrendo",
+        "username": "lulaoficial",          // opcional
+        "politician_name": "Lula",          // opcional
+        "context": "contexto adicional",    // opcional
+        "simulate": true                    // se true, simula cada resposta
+    }
+    """
+    try:
+        from anthropic import Anthropic
+
+        data = request.get_json(force=True) or {}
+        attack = data.get("attack", "").strip()
+        username = data.get("username")
+        politician_name = data.get("politician_name", "candidato")
+        context = data.get("context", "")
+        simulate = data.get("simulate", True)
+
+        if not attack:
+            return jsonify({"error": "Campo 'attack' é obrigatório."}), 400
+
+        # ── Geração das 3 respostas via Claude ──
+        client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+
+        prompt = f"""Você é um estrategista de comunicação política sênior numa War Room de campanha brasileira.
+
+POLÍTICO: {politician_name}
+ATAQUE RECEBIDO: "{attack}"
+CONTEXTO: {context or 'campanha eleitoral em andamento'}
+
+Gere EXATAMENTE 3 respostas estratégicas, cada uma com abordagem diferente:
+
+1. DEFENSIVA — esclarece, contextualiza, desarma sem confrontar
+2. OFENSIVA — vira o jogo, ataca quem atacou, expõe contradições
+3. DESVIO — muda o assunto para pauta forte do candidato
+
+Cada resposta deve:
+- Ter 2-3 frases curtas (formato post de redes sociais)
+- Soar autêntica em português brasileiro (não acadêmica)
+- Ser publicável diretamente
+
+Responda APENAS com JSON válido, sem texto antes ou depois:
+
+{{
+  "respostas": [
+    {{"estrategia": "defensiva", "texto": "...", "tom": "calmo|sereno|firme", "risco": "baixo|medio|alto"}},
+    {{"estrategia": "ofensiva", "texto": "...", "tom": "...", "risco": "..."}},
+    {{"estrategia": "desvio", "texto": "...", "tom": "...", "risco": "..."}}
+  ]
+}}"""
+
+        msg = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=1500,
+            temperature=0.8,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        raw = msg.content[0].text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1] if raw.count("```") >= 2 else raw
+            if raw.startswith("json"):
+                raw = raw[4:]
+        if "{" in raw and "}" in raw:
+            raw = raw[raw.index("{"):raw.rindex("}")+1]
+
+        parsed = json.loads(raw.strip()) if False else __import__("json").loads(raw.strip())
+        respostas = parsed.get("respostas", [])
+
+        # ── Simulação de cada resposta (opcional) ──
+        if simulate and respostas:
+            for r in respostas:
+                try:
+                    sim = simular(
+                        conteudo=r["texto"],
+                        n_agentes=30,  # amostra menor pra ser rápido
+                        contexto=f"resposta de {politician_name} ao ataque: {attack[:100]}"
+                    )
+                    r["simulation"] = {
+                        "crisis_score":  sim.get("crisis_score"),
+                        "viral_risk":    sim.get("risco_viralizacao_medio"),
+                        "share_pct":     sim.get("engajamento", {}).get("compartilhamento_pct"),
+                        "sentiment":     sim.get("sentimento_distribuicao", {}),
+                        "agents":        sim.get("total_agentes"),
+                    }
+                except Exception as sim_err:
+                    r["simulation"] = {"error": str(sim_err)}
+
+        # ── Persiste histórico ──
+        try:
+            db = get_db()
+            for r in respostas:
+                db.table("war_room_responses").insert({
+                    "username":        username,
+                    "attack_content":  attack,
+                    "response_text":   r["texto"],
+                    "strategy":        r["estrategia"],
+                    "simulation_data": r.get("simulation"),
+                }).execute()
+        except Exception:
+            pass  # histórico é opcional
+
+        return jsonify({
+            "politician":   politician_name,
+            "attack":       attack,
+            "respostas":    respostas,
+            "simulated":    simulate,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 # ── BUSCA DE MENÇÕES ──────────────────────────────────────────────────────────
 
 @app.route("/search/mentions", methods=["GET"])
