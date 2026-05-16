@@ -634,7 +634,7 @@ def analyze_comments(username):
             .eq("owner_username", username)
             .not_.is_("text", "null")
             .order("likes_count", desc=True)
-            .limit(100)
+            .limit(200)
             .execute()
         )
 
