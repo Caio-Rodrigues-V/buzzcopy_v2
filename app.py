@@ -8,7 +8,8 @@ import json
 import uuid
 import logging
 from datetime import datetime, timezone, timedelta
-
+from collectors.instagram import InstagramCollector
+from collectors.twitter   import TwitterCollector
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
@@ -239,7 +240,7 @@ from collectors.instagram import InstagramCollector
 
 COLLECTOR_REGISTRY = {
     "instagram": InstagramCollector,
-    # "twitter": TwitterCollector,   ← Rodada 2
+     "twitter": TwitterCollector, 
     # "news":    NewsCollector,      ← Rodada 3
 }
 
