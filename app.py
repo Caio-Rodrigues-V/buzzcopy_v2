@@ -6,12 +6,14 @@ Multi-tenant com JWT (ver auth.py).
 import os
 import json
 import uuid
+import logging
 from datetime import datetime, timezone, timedelta
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request, g
 from flask_cors import CORS
 from supabase import create_client, Client
+from json_repair import repair_json
 
 from collector import YouTubeCollector
 from analyzer import SentimentAnalyzer
@@ -22,28 +24,62 @@ from charts import register_chart_routes
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
 
-print("SUPABASE_URL =", os.getenv("SUPABASE_URL"))
-print("SUPABASE_KEY carregada =", bool(os.getenv("SUPABASE_KEY")))
+# ── LOGGING ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("pulse")
+
+# ── VALIDAÇÃO DE ENV NO STARTUP (Fix #8) ──────────────────────────────────────
+REQUIRED_ENV = ["SUPABASE_URL", "SUPABASE_KEY", "ANTHROPIC_API_KEY", "JWT_SECRET"]
+missing = [k for k in REQUIRED_ENV if not os.getenv(k)]
+if missing:
+    raise RuntimeError(f"Variáveis de ambiente obrigatórias faltando: {missing}")
+
+if os.getenv("JWT_SECRET") == "change-me-in-prod":
+    raise RuntimeError("JWT_SECRET ainda está no valor default. Defina um secret real.")
+
+log.info("SUPABASE_URL = %s", os.getenv("SUPABASE_URL"))
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+
+# ── CORS RESTRITO (Fix #10) ───────────────────────────────────────────────────
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
+
 register_auth_routes(app)
 register_chart_routes(app)
 
 
-# ── CLIENTES ──────────────────────────────────────────────────────────────────
+# ── SINGLETONS (Fix #9) ───────────────────────────────────────────────────────
+_db_client = None
+_youtube_client = None
+_analyzer_client = None
 
-def get_youtube() -> YouTubeCollector:
-    return YouTubeCollector(os.environ["YOUTUBE_API_KEY"])
-
-def get_analyzer() -> SentimentAnalyzer:
-    return SentimentAnalyzer(
-        anthropic_key=os.environ["ANTHROPIC_API_KEY"],
-        hf_token=os.environ.get("HF_TOKEN"),
-    )
 
 def get_db() -> Client:
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    global _db_client
+    if _db_client is None:
+        _db_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    return _db_client
+
+
+def get_youtube() -> YouTubeCollector:
+    global _youtube_client
+    if _youtube_client is None:
+        _youtube_client = YouTubeCollector(os.environ["YOUTUBE_API_KEY"])
+    return _youtube_client
+
+
+def get_analyzer() -> SentimentAnalyzer:
+    global _analyzer_client
+    if _analyzer_client is None:
+        _analyzer_client = SentimentAnalyzer(
+            anthropic_key=os.environ["ANTHROPIC_API_KEY"],
+            hf_token=os.environ.get("HF_TOKEN"),
+        )
+    return _analyzer_client
 
 
 def user_profile_ids(user_id: str, platform: str = None) -> list:
@@ -60,7 +96,11 @@ def user_profile_ids(user_id: str, platform: str = None) -> list:
 
 @app.route("/", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "social-monitor-api", "version": "1.2.0"})
+    return jsonify({
+        "status": "ok",
+        "service": "social-monitor-api",
+        "version": os.getenv("APP_VERSION", "1.3.0"),
+    })
 
 
 # ── PERFIS ────────────────────────────────────────────────────────────────────
@@ -77,6 +117,7 @@ def list_profiles():
         result = query.execute()
         return jsonify({"profiles": result.data})
     except Exception as e:
+        log.exception("list_profiles failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -99,31 +140,54 @@ def add_profile():
         }).execute()
         return jsonify({"profile": result.data[0]}), 201
     except Exception as e:
+        log.exception("add_profile failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/profiles/<profile_id>", methods=["DELETE"])
 @require_auth
 def delete_profile(profile_id):
-    """Deleta perfil + dados associados (apenas dono ou admin)."""
+    """
+    Deleta perfil + dados associados.
+    Fix #4: só deleta dados Instagram se NENHUM outro perfil ainda referenciar
+    o mesmo username.
+    """
     try:
         db = get_db()
-        profile = db.table("profiles").select("platform_id, user_id").eq("id", profile_id).execute()
+        profile = db.table("profiles").select("platform_id, platform, user_id").eq("id", profile_id).execute()
         if not profile.data:
             return jsonify({"error": "Perfil não encontrado"}), 404
 
-        if g.role != "admin" and profile.data[0]["user_id"] != g.user_id:
+        p = profile.data[0]
+        if g.role != "admin" and p["user_id"] != g.user_id:
             return jsonify({"error": "Sem permissão pra deletar este perfil"}), 403
 
-        username = profile.data[0]["platform_id"]
-        if username:
+        username = p["platform_id"]
+        platform = p["platform"]
+
+        # Verifica se outros perfis ainda referenciam esse username
+        others = (
+            db.table("profiles")
+            .select("id")
+            .eq("platform", platform)
+            .eq("platform_id", username)
+            .neq("id", profile_id)
+            .execute()
+        )
+        outros_referenciam = bool(others.data)
+
+        # Deleta dados Instagram só se mais ninguém referenciar (Fix #4)
+        if username and platform == "instagram" and not outros_referenciam:
             db.table("instagram_comments").delete().eq("owner_username", username).execute()
             db.table("instagram_posts").delete().eq("owner_username", username).execute()
+
+        # Posts ligados diretamente a este profile_id (caso o owner_username não exista)
         db.table("instagram_posts").delete().eq("profile_id", profile_id).execute()
         db.table("profiles").delete().eq("id", profile_id).execute()
 
-        return jsonify({"deleted": profile_id})
+        return jsonify({"deleted": profile_id, "shared_data_kept": outros_referenciam})
     except Exception as e:
+        log.exception("delete_profile failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -132,10 +196,6 @@ def delete_profile(profile_id):
 @app.route("/collect/youtube/<channel_id>", methods=["POST"])
 @require_auth
 def collect_youtube(channel_id):
-    """
-    Coleta dados de um canal do YouTube e armazena no Supabase.
-    Query params: days (default 30)
-    """
     if g.role != "admin" and not user_owns_profile(channel_id, g.user_id, platform="youtube"):
         return jsonify({"error": "Acesso negado a este canal"}), 403
 
@@ -143,8 +203,8 @@ def collect_youtube(channel_id):
 
     try:
         collector = get_youtube()
-        data      = collector.collect_full_profile(channel_id, days=days)
-        db        = get_db()
+        data = collector.collect_full_profile(channel_id, days=days)
+        db = get_db()
 
         db.table("channel_snapshots").insert({
             "channel_id":       channel_id,
@@ -170,16 +230,13 @@ def collect_youtube(channel_id):
         })
 
     except Exception as e:
+        log.exception("collect_youtube failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/collect/instagram/<username>", methods=["POST"])
 @require_auth
 def collect_instagram(username):
-    """
-    Coleta posts do Instagram via Apify e armazena no Supabase.
-    Query params: limit (default 50)
-    """
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
@@ -219,8 +276,11 @@ def collect_instagram(username):
 
         rows = []
         for post in posts:
+            # Fix #7: garante que o id existe antes de inserir
+            if not post.get("id"):
+                continue
             rows.append({
-                "id":               post.get("id"),
+                "id":               post["id"],
                 "profile_id":       profile_id,
                 "owner_username":   post.get("ownerUsername"),
                 "caption":          post.get("caption"),
@@ -243,16 +303,13 @@ def collect_instagram(username):
         })
 
     except Exception as e:
+        log.exception("collect_instagram failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/collect/comments/<username>", methods=["POST"])
 @require_auth
 def collect_comments(username):
-    """
-    Coleta comentários dos posts do Instagram via Apify.
-    Query params: posts_limit (default 10), comments_per_post (default 20)
-    """
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
@@ -297,10 +354,12 @@ def collect_comments(username):
 
         rows = []
         for c in comments:
+            if not c.get("id"):
+                continue
             post_url = c.get("postUrl") or c.get("url", "")
             post_id = post_url_map.get(post_url)
             rows.append({
-                "id":                 str(c.get("id")),
+                "id":                 str(c["id"]),
                 "post_id":            post_id,
                 "owner_username":     username,
                 "post_url":           post_url,
@@ -320,6 +379,7 @@ def collect_comments(username):
         })
 
     except Exception as e:
+        log.exception("collect_comments failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -329,23 +389,40 @@ def collect_comments(username):
 @require_auth
 def analyze_youtube(channel_id):
     """
-    Coleta + analisa sentimento de um canal do YouTube. Salva o relatório.
-    Query params: days (default 30)
+    Fix #2: agora persiste vídeos e snapshot junto com a análise.
     """
     if g.role != "admin" and not user_owns_profile(channel_id, g.user_id, platform="youtube"):
         return jsonify({"error": "Acesso negado a este canal"}), 403
 
-    days         = int(request.args.get("days", 30))
+    days = int(request.args.get("days", 30))
     profile_name = request.args.get("name", channel_id)
 
     try:
         collector = get_youtube()
-        data      = collector.collect_full_profile(channel_id, days=days)
+        data = collector.collect_full_profile(channel_id, days=days)
+
+        db = get_db()
+
+        # Fix #2: persiste snapshot e vídeos (antes só consumia quota e descartava)
+        db.table("channel_snapshots").insert({
+            "channel_id":       channel_id,
+            "name":             data["channel"]["name"],
+            "subscriber_count": data["channel"]["subscriber_count"],
+            "video_count":      data["channel"]["video_count"],
+            "total_views":      data["channel"]["total_views"],
+            "engagement_rate":  data["metrics"]["engagement_rate_pct"],
+            "collected_at":     datetime.now(timezone.utc).isoformat(),
+        }).execute()
+
+        if data["videos"]:
+            db.table("videos").upsert(
+                [{**v, "channel_id": channel_id} for v in data["videos"]],
+                on_conflict="video_id"
+            ).execute()
 
         analyzer = get_analyzer()
         analysis = analyzer.analyze(data["comments"], profile_name)
 
-        db = get_db()
         report = {
             "channel_id":           channel_id,
             "profile_name":         profile_name,
@@ -374,13 +451,17 @@ def analyze_youtube(channel_id):
         })
 
     except Exception as e:
+        log.exception("analyze_youtube failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/analyze/instagram/<username>", methods=["POST"])
 @require_auth
 def analyze_instagram(username):
-    """Analisa sentimento das captions dos posts do Instagram."""
+    """
+    Fix #1: não escreve mais ai_summary em TODOS os posts (corrompia dados).
+    O resumo geral vai pra analysis_reports com platform='instagram'.
+    """
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
@@ -409,15 +490,32 @@ def analyze_instagram(username):
         analyzer = get_analyzer()
         analysis = analyzer.analyze(comments, username)
 
+        # Atualiza sentimento por post (legítimo: cada post tem seu próprio sentimento)
         for s in analysis["sentiments"]:
             db.table("instagram_posts").update({
                 "sentiment": s["sentiment"]
             }).eq("id", s["id"]).execute()
 
+        # Fix #1: salva resumo geral em analysis_reports (não corrompe mais os posts)
         summary = analysis["summary"]
-        db.table("instagram_posts").update({
-            "ai_summary": summary["narrative"]
-        }).eq("owner_username", username).execute()
+        report = {
+            "channel_id":           username,  # reusa o campo channel_id pra username IG
+            "profile_name":         username,
+            "period_days":          0,  # 0 = análise pontual, não baseada em dias
+            "comments_analyzed":    summary["comments_analyzed"],
+            "positive_pct":         summary["positive_pct"],
+            "negative_pct":         summary["negative_pct"],
+            "neutral_pct":          summary["neutral_pct"],
+            "overall_score":        summary["overall_score"],
+            "crisis_alert":         summary["crisis_alert"],
+            "crisis_reason":        summary["crisis_reason"],
+            "main_themes":          summary["main_themes"],
+            "top_positive_quote":   summary["top_positive_quote"],
+            "top_negative_quote":   summary["top_negative_quote"],
+            "narrative":            summary["narrative"],
+            "created_at":           datetime.now(timezone.utc).isoformat(),
+        }
+        db.table("analysis_reports").insert(report).execute()
 
         return jsonify({
             "username":       username,
@@ -426,13 +524,13 @@ def analyze_instagram(username):
         })
 
     except Exception as e:
+        log.exception("analyze_instagram failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/analyze/comments/<username>", methods=["POST"])
 @require_auth
 def analyze_comments(username):
-    """Analisa sentimento dos comentários do Instagram via Claude."""
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
@@ -473,20 +571,15 @@ def analyze_comments(username):
         })
 
     except Exception as e:
+        log.exception("analyze_comments failed")
         return jsonify({"error": str(e)}), 500
 
 
-# ── SIMULADOR DE CENÁRIOS (MiroFish-inspired) ─────────────────────────────────
+# ── SIMULADOR DE CENÁRIOS ─────────────────────────────────────────────────────
 
 @app.route("/simulate/scenario", methods=["POST"])
 @require_auth
 def simulate_scenario():
-    """
-    Simula reação do eleitorado brasileiro a um conteúdo político.
-
-    Body JSON: { "conteudo", "n_agentes"?, "filtros"?, "contexto"?, "username"? }
-    Se 'username' for fornecido, valida ownership.
-    """
     try:
         data = request.get_json(force=True) or {}
         conteudo = data.get("conteudo", "").strip()
@@ -527,36 +620,44 @@ def simulate_scenario():
         return jsonify(forecast)
 
     except Exception as e:
+        log.exception("simulate_scenario failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/simulate/history/<username>", methods=["GET"])
 @require_auth
 def simulate_history(username):
-    """Lista simulações anteriores associadas a um perfil."""
+    """
+    Fix #3: filtra por user_id também, não só username.
+    Antes: dois users monitorando o mesmo perfil viam simulações um do outro.
+    """
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
     limit = int(request.args.get("limit", 20))
     try:
         db = get_db()
-        res = (
+        query = (
             db.table("simulacoes")
             .select("*")
             .eq("username", username)
             .order("created_at", desc=True)
             .limit(limit)
-            .execute()
         )
+        # Admin vê tudo, cliente só as próprias
+        if g.role != "admin":
+            query = query.eq("user_id", g.user_id)
+
+        res = query.execute()
         return jsonify({"username": username, "simulations": res.data})
     except Exception as e:
+        log.exception("simulate_history failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/simulate/<sim_id>", methods=["GET"])
 @require_auth
 def get_simulation(sim_id):
-    """Recupera uma simulação específica pelo ID."""
     try:
         db = get_db()
         res = db.table("simulacoes").select("*").eq("id", sim_id).limit(1).execute()
@@ -576,6 +677,7 @@ def get_simulation(sim_id):
 
         return jsonify(sim)
     except Exception as e:
+        log.exception("get_simulation failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -585,88 +687,123 @@ def get_simulation(sim_id):
 @require_auth
 def warroom_threat_level():
     """
-    Threat level (DEFCON) sobre os perfis do usuário logado.
-    Considera: % negativo 24h, pico de volume, perfis em crise.
+    Fix #5: agora considera tanto Instagram (comentários 24h) quanto YouTube
+    (analysis_reports com crisis_alert). Antes só olhava Instagram.
     """
     try:
         db = get_db()
         cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
         cutoff_7d = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat()
 
-        # Perfis do usuário (admin vê todos)
+        # Perfis do usuário
         profiles_q = db.table("profiles").select("*")
         if g.role != "admin":
             profiles_q = profiles_q.eq("user_id", g.user_id)
         profiles = profiles_q.execute().data or []
 
         ig_usernames = [p["platform_id"] for p in profiles if p["platform"] == "instagram"]
-        if not ig_usernames:
-            return jsonify({
-                "defcon": 5, "label": "ALL CLEAR", "color": "green",
-                "threat_score": 0, "negative_pct_24h": 0, "comments_24h": 0,
-                "spike_factor": 0, "has_spike": False, "crisis_profiles": 0,
-                "total_profiles": 0, "per_profile": {},
-                "calculated_at": datetime.now(timezone.utc).isoformat(),
-            })
-
-        recent_res = (
-            db.table("instagram_comments")
-            .select("sentiment, owner_username, likes_count, timestamp")
-            .in_("owner_username", ig_usernames)
-            .gte("timestamp", cutoff_24h)
-            .execute()
-        )
-        recent = recent_res.data or []
-
-        baseline_res = (
-            db.table("instagram_comments")
-            .select("timestamp, owner_username")
-            .in_("owner_username", ig_usernames)
-            .gte("timestamp", cutoff_7d)
-            .execute()
-        )
-        baseline = baseline_res.data or []
-
-        total_24h = len(recent)
-        total_7d = len(baseline) or 1
-        avg_daily = total_7d / 7
-
-        spike_factor = total_24h / avg_daily if avg_daily > 0 else 0
-        has_spike = spike_factor > 1.5
-
-        analyzed = [c for c in recent if c.get("sentiment")]
-        neg_count = len([c for c in analyzed if c.get("sentiment") == "negative"])
-        neg_pct = (neg_count / len(analyzed) * 100) if analyzed else 0
+        yt_channels = [p["platform_id"] for p in profiles if p["platform"] == "youtube"]
 
         threat_score = 0
-        if neg_pct > 60: threat_score += 40
-        elif neg_pct > 40: threat_score += 25
-        elif neg_pct > 25: threat_score += 12
-
-        if has_spike: threat_score += 25
-        if spike_factor > 3: threat_score += 15
-
-        crisis_profiles_count = 0
         per_profile = {}
-        for p in profiles:
-            if p["platform"] != "instagram":
-                continue
-            user = p["platform_id"]
-            user_comments = [c for c in analyzed if c.get("owner_username") == user]
-            if not user_comments:
-                continue
-            user_neg = len([c for c in user_comments if c["sentiment"] == "negative"])
-            user_neg_pct = (user_neg / len(user_comments)) * 100
-            per_profile[user] = {
-                "name": p["name"],
-                "username": user,
-                "neg_pct": round(user_neg_pct, 1),
-                "comments_24h": len(user_comments),
-                "in_crisis": user_neg_pct > 50,
-            }
-            if user_neg_pct > 50:
-                crisis_profiles_count += 1
-                threat_score += 10
+        crisis_profiles_count = 0
+        neg_pct = 0
+        total_24h = 0
+        spike_factor = 0
+        has_spike = False
+
+        # ── Instagram (mesma lógica de antes) ──
+        if ig_usernames:
+            recent = (
+                db.table("instagram_comments")
+                .select("sentiment, owner_username, likes_count, timestamp")
+                .in_("owner_username", ig_usernames)
+                .gte("timestamp", cutoff_24h)
+                .execute()
+            ).data or []
+
+            baseline = (
+                db.table("instagram_comments")
+                .select("timestamp, owner_username")
+                .in_("owner_username", ig_usernames)
+                .gte("timestamp", cutoff_7d)
+                .execute()
+            ).data or []
+
+            total_24h = len(recent)
+            total_7d = len(baseline) or 1
+            avg_daily = total_7d / 7
+
+            spike_factor = total_24h / avg_daily if avg_daily > 0 else 0
+            has_spike = spike_factor > 1.5
+
+            analyzed = [c for c in recent if c.get("sentiment")]
+            neg_count = len([c for c in analyzed if c.get("sentiment") == "negative"])
+            neg_pct = (neg_count / len(analyzed) * 100) if analyzed else 0
+
+            if neg_pct > 60: threat_score += 40
+            elif neg_pct > 40: threat_score += 25
+            elif neg_pct > 25: threat_score += 12
+
+            if has_spike: threat_score += 25
+            if spike_factor > 3: threat_score += 15
+
+            for p in profiles:
+                if p["platform"] != "instagram":
+                    continue
+                user = p["platform_id"]
+                user_comments = [c for c in analyzed if c.get("owner_username") == user]
+                if not user_comments:
+                    continue
+                user_neg = len([c for c in user_comments if c["sentiment"] == "negative"])
+                user_neg_pct = (user_neg / len(user_comments)) * 100
+                per_profile[user] = {
+                    "name": p["name"],
+                    "platform": "instagram",
+                    "neg_pct": round(user_neg_pct, 1),
+                    "comments_24h": len(user_comments),
+                    "in_crisis": user_neg_pct > 50,
+                }
+                if user_neg_pct > 50:
+                    crisis_profiles_count += 1
+                    threat_score += 10
+
+        # ── YouTube (Fix #5: considera crisis_alert dos relatórios) ──
+        yt_crisis_count = 0
+        if yt_channels:
+            yt_reports = (
+                db.table("analysis_reports")
+                .select("channel_id, profile_name, crisis_alert, negative_pct, narrative, created_at")
+                .in_("channel_id", yt_channels)
+                .gte("created_at", cutoff_7d)
+                .order("created_at", desc=True)
+                .execute()
+            ).data or []
+
+            seen_channels = set()
+            for r in yt_reports:
+                ch = r["channel_id"]
+                if ch in seen_channels:
+                    continue
+                seen_channels.add(ch)
+
+                p_match = next((p for p in profiles if p["platform_id"] == ch), None)
+                if not p_match:
+                    continue
+
+                per_profile[ch] = {
+                    "name": r.get("profile_name") or p_match["name"],
+                    "platform": "youtube",
+                    "neg_pct": r.get("negative_pct") or 0,
+                    "in_crisis": bool(r.get("crisis_alert")),
+                    "last_report_at": r.get("created_at"),
+                }
+                if r.get("crisis_alert"):
+                    yt_crisis_count += 1
+                    crisis_profiles_count += 1
+                    threat_score += 20
+                elif (r.get("negative_pct") or 0) > 50:
+                    threat_score += 10
 
         threat_score = min(100, threat_score)
 
@@ -686,18 +823,19 @@ def warroom_threat_level():
             "spike_factor":     round(spike_factor, 2),
             "has_spike":        has_spike,
             "crisis_profiles":  crisis_profiles_count,
-            "total_profiles":   len(ig_usernames),
+            "yt_crisis_count":  yt_crisis_count,
+            "total_profiles":   len(ig_usernames) + len(yt_channels),
             "per_profile":      per_profile,
             "calculated_at":    datetime.now(timezone.utc).isoformat(),
         })
     except Exception as e:
+        log.exception("warroom_threat_level failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/warroom/negative-feed", methods=["GET"])
 @require_auth
 def warroom_negative_feed():
-    """Feed de comentários negativos dos perfis do usuário logado."""
     try:
         limit = int(request.args.get("limit", 30))
         hours = int(request.args.get("hours", 24))
@@ -705,7 +843,6 @@ def warroom_negative_feed():
 
         db = get_db()
 
-        # Filtra pelos perfis do usuário
         profiles_q = db.table("profiles").select("platform_id, name").eq("platform", "instagram")
         if g.role != "admin":
             profiles_q = profiles_q.eq("user_id", g.user_id)
@@ -734,6 +871,7 @@ def warroom_negative_feed():
         return jsonify({"comments": comments, "total": len(comments)})
 
     except Exception as e:
+        log.exception("warroom_negative_feed failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -741,9 +879,7 @@ def warroom_negative_feed():
 @require_auth
 def warroom_generate_response():
     """
-    Gera 3 respostas estratégicas a um ataque e simula cada uma.
-
-    Body JSON: { "attack", "username"?, "politician_name"?, "context"?, "simulate"? }
+    Gera 3 respostas estratégicas. Usa json_repair pra ser robusto a parsing.
     """
     try:
         from anthropic import Anthropic
@@ -797,15 +933,29 @@ Responda APENAS com JSON válido, sem texto antes ou depois:
             messages=[{"role": "user", "content": prompt}],
         )
 
+        # Fix #6: parsing robusto via json_repair
         raw = msg.content[0].text.strip()
         if "```" in raw:
-            raw = raw.split("```")[1] if raw.count("```") >= 2 else raw
-            if raw.startswith("json"):
-                raw = raw[4:]
-        if "{" in raw and "}" in raw:
-            raw = raw[raw.index("{"):raw.rindex("}")+1]
+            parts = raw.split("```")
+            for part in parts:
+                part = part.strip()
+                if part.startswith("json"):
+                    part = part[4:].strip()
+                if part.startswith("{"):
+                    raw = part
+                    break
 
-        parsed = json.loads(raw.strip())
+        start = raw.find("{")
+        end = raw.rfind("}") + 1
+        if start != -1 and end > start:
+            raw = raw[start:end]
+
+        try:
+            parsed = json.loads(repair_json(raw))
+        except Exception as parse_err:
+            log.error("Falha ao parsear resposta de Claude no war room: %s | raw=%s", parse_err, raw[:300])
+            return jsonify({"error": "Resposta inválida do modelo. Tente novamente."}), 502
+
         respostas = parsed.get("respostas", [])
 
         if simulate and respostas:
@@ -837,8 +987,8 @@ Responda APENAS com JSON válido, sem texto antes ou depois:
                     "strategy":        r["estrategia"],
                     "simulation_data": r.get("simulation"),
                 }).execute()
-        except Exception:
-            pass
+        except Exception as db_err:
+            log.warning("Falha ao salvar war_room_responses: %s", db_err)
 
         return jsonify({
             "politician":   politician_name,
@@ -849,6 +999,7 @@ Responda APENAS com JSON válido, sem texto antes ou depois:
         })
 
     except Exception as e:
+        log.exception("warroom_generate_response failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -857,10 +1008,6 @@ Responda APENAS com JSON válido, sem texto antes ou depois:
 @app.route("/search/mentions", methods=["GET"])
 @require_auth
 def search_mentions():
-    """
-    Busca menções públicas de um termo via SerpApi.
-    Query params: q (termo), limit (default 10)
-    """
     query = request.args.get("q", "").strip()
     limit = int(request.args.get("limit", 10))
 
@@ -905,7 +1052,7 @@ def search_mentions():
             for i, s in enumerate(analysis["sentiments"]):
                 if i < len(mentions):
                     mentions[i]["sentiment"] = s["sentiment"]
-                    mentions[i]["score"]     = s["score"]
+                    mentions[i]["score"] = s["score"]
 
         return jsonify({
             "query":    query,
@@ -914,6 +1061,7 @@ def search_mentions():
         })
 
     except Exception as e:
+        log.exception("search_mentions failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -922,7 +1070,6 @@ def search_mentions():
 @app.route("/instagram/posts/<username>", methods=["GET"])
 @require_auth
 def get_instagram_posts(username):
-    """Retorna posts do Instagram já coletados no Supabase."""
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
@@ -939,13 +1086,13 @@ def get_instagram_posts(username):
         )
         return jsonify({"username": username, "posts": result.data})
     except Exception as e:
+        log.exception("get_instagram_posts failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/instagram/comments/<username>", methods=["GET"])
 @require_auth
 def get_comment_analysis(username):
-    """Retorna comentários e análise do Instagram."""
     if g.role != "admin" and not user_owns_profile(username, g.user_id):
         return jsonify({"error": "Acesso negado a este perfil"}), 403
 
@@ -961,6 +1108,7 @@ def get_comment_analysis(username):
         )
         return jsonify({"username": username, "comments": result.data})
     except Exception as e:
+        log.exception("get_comment_analysis failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -969,7 +1117,6 @@ def get_comment_analysis(username):
 @app.route("/reports/<channel_id>", methods=["GET"])
 @require_auth
 def get_reports(channel_id):
-    """Retorna histórico de relatórios de um canal YouTube."""
     if g.role != "admin" and not user_owns_profile(channel_id, g.user_id, platform="youtube"):
         return jsonify({"error": "Acesso negado a este canal"}), 403
 
@@ -986,13 +1133,13 @@ def get_reports(channel_id):
         )
         return jsonify({"channel_id": channel_id, "reports": result.data})
     except Exception as e:
+        log.exception("get_reports failed")
         return jsonify({"error": str(e)}), 500
 
 
 @app.route("/reports/latest", methods=["GET"])
 @require_auth
 def get_all_latest():
-    """Retorna o relatório mais recente de cada canal do usuário."""
     try:
         db = get_db()
 
@@ -1025,6 +1172,7 @@ def get_all_latest():
 
         return jsonify({"reports": latest})
     except Exception as e:
+        log.exception("get_all_latest failed")
         return jsonify({"error": str(e)}), 500
 
 
@@ -1033,7 +1181,6 @@ def get_all_latest():
 @app.route("/snapshots/<channel_id>", methods=["GET"])
 @require_auth
 def get_snapshots(channel_id):
-    """Retorna histórico de métricas do canal (para gráfico de crescimento)."""
     if g.role != "admin" and not user_owns_profile(channel_id, g.user_id, platform="youtube"):
         return jsonify({"error": "Acesso negado a este canal"}), 403
 
@@ -1050,6 +1197,7 @@ def get_snapshots(channel_id):
         )
         return jsonify({"channel_id": channel_id, "snapshots": result.data})
     except Exception as e:
+        log.exception("get_snapshots failed")
         return jsonify({"error": str(e)}), 500
 
 

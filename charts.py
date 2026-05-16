@@ -3,6 +3,7 @@ charts.py — 4 endpoints de agregação pro dashboard.
 Todos protegidos por JWT + checagem de ownership.
 """
 import os
+import logging
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
 from flask import jsonify, request, g
@@ -10,13 +11,20 @@ from supabase import create_client
 
 from auth import require_auth, user_owns_profile
 
+log = logging.getLogger("pulse.charts")
+
+# ── SINGLETON (Fix #9) ────────────────────────────────────────────────────────
+_db_client = None
+
 
 def _db():
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    global _db_client
+    if _db_client is None:
+        _db_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    return _db_client
 
 
 def _guard(username):
-    """Retorna erro se o user logado não for dono. Admin passa direto."""
     if g.role == "admin":
         return None
     if not user_owns_profile(username, g.user_id):
@@ -26,7 +34,6 @@ def _guard(username):
 
 def register_chart_routes(app):
 
-    # ── 1. SENTIMENT TIMELINE ─────────────────────────────────────────────────
     @app.route("/charts/sentiment-timeline/<username>", methods=["GET"])
     @require_auth
     def sentiment_timeline(username):
@@ -72,10 +79,10 @@ def register_chart_routes(app):
 
             return jsonify({"username": username, "days": days, "timeline": timeline})
         except Exception as e:
+            log.exception("sentiment_timeline failed")
             return jsonify({"error": str(e)}), 500
 
 
-    # ── 2. ENGAGEMENT BY POST TYPE ────────────────────────────────────────────
     @app.route("/charts/engagement-by-type/<username>", methods=["GET"])
     @require_auth
     def engagement_by_type(username):
@@ -116,10 +123,10 @@ def register_chart_routes(app):
             breakdown.sort(key=lambda x: x["avg_engagement"], reverse=True)
             return jsonify({"username": username, "breakdown": breakdown})
         except Exception as e:
+            log.exception("engagement_by_type failed")
             return jsonify({"error": str(e)}), 500
 
 
-    # ── 3. PEAK HOURS HEATMAP ─────────────────────────────────────────────────
     @app.route("/charts/peak-hours/<username>", methods=["GET"])
     @require_auth
     def peak_hours(username):
@@ -136,7 +143,6 @@ def register_chart_routes(app):
                 .execute()
             )
 
-            # matriz 7 dias × 24 horas (horário BR)
             matrix = [[{"count": 0, "likes": 0} for _ in range(24)] for _ in range(7)]
             weekday_labels = ["Seg", "Ter", "Qua", "Qui", "Sex", "Sáb", "Dom"]
 
@@ -167,10 +173,10 @@ def register_chart_routes(app):
             peaks = sorted(heatmap, key=lambda x: x["score"], reverse=True)[:5]
             return jsonify({"username": username, "heatmap": heatmap, "top_peaks": peaks})
         except Exception as e:
+            log.exception("peak_hours failed")
             return jsonify({"error": str(e)}), 500
 
 
-    # ── 4. THEMES + WORD CLOUD ────────────────────────────────────────────────
     @app.route("/charts/themes/<username>", methods=["GET"])
     @require_auth
     def themes(username):
@@ -183,7 +189,6 @@ def register_chart_routes(app):
         try:
             db = _db()
 
-            # Temas dos relatórios (Claude já extraiu)
             reports_res = (
                 db.table("analysis_reports")
                 .select("main_themes, created_at")
@@ -200,7 +205,6 @@ def register_chart_routes(app):
 
             top_themes = [{"theme": t, "count": c} for t, c in theme_counter.most_common(15)]
 
-            # Word frequency dos comentários
             comments_res = (
                 db.table("instagram_comments")
                 .select("text")
@@ -239,4 +243,5 @@ def register_chart_routes(app):
                 "word_cloud": word_cloud,
             })
         except Exception as e:
+            log.exception("themes failed")
             return jsonify({"error": str(e)}), 500

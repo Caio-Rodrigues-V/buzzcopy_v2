@@ -2,6 +2,7 @@
 auth.py — Autenticação JWT + decorators de proteção.
 """
 import os
+import logging
 import jwt
 import bcrypt
 from datetime import datetime, timedelta, timezone
@@ -9,13 +10,25 @@ from functools import wraps
 from flask import request, jsonify, g
 from supabase import create_client
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-prod")
+log = logging.getLogger("pulse.auth")
+
+JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALG = "HS256"
 JWT_EXP_HOURS = 24 * 7  # 1 semana
 
+if not JWT_SECRET or JWT_SECRET == "change-me-in-prod":
+    raise RuntimeError("JWT_SECRET não configurado (ou ainda no default). Defina uma chave segura.")
+
+
+# ── SINGLETON DB CLIENT (Fix #9) ──────────────────────────────────────────────
+_db_client = None
+
 
 def _db():
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    global _db_client
+    if _db_client is None:
+        _db_client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
+    return _db_client
 
 
 def hash_password(plain: str) -> str:
@@ -41,7 +54,6 @@ def decode_token(token: str) -> dict:
 
 
 def require_auth(f):
-    """Exige JWT válido. Injeta g.user_id e g.role."""
     @wraps(f)
     def wrapper(*args, **kwargs):
         auth = request.headers.get("Authorization", "")
@@ -100,7 +112,6 @@ def register_auth_routes(app):
     @app.route("/auth/register", methods=["POST"])
     @require_admin
     def register():
-        """Só admin cria usuários."""
         data = request.get_json() or {}
         email = data.get("email", "").strip().lower()
         password = data.get("password", "")
@@ -125,8 +136,13 @@ def register_auth_routes(app):
                 "role": role,
             }).execute()
 
+            # Log de criação de admin (Fix #16 mini)
+            if role == "admin":
+                log.warning("⚠️ Novo ADMIN criado: %s por %s", email, g.user_id)
+
             return jsonify({"user": {"id": result.data[0]["id"], "email": email, "role": role}}), 201
         except Exception as e:
+            log.exception("register failed")
             return jsonify({"error": str(e)}), 500
 
     @app.route("/auth/login", methods=["POST"])
@@ -155,6 +171,7 @@ def register_auth_routes(app):
                 "expires_in_hours": JWT_EXP_HOURS,
             })
         except Exception as e:
+            log.exception("login failed")
             return jsonify({"error": str(e)}), 500
 
     @app.route("/auth/me", methods=["GET"])
@@ -167,11 +184,11 @@ def register_auth_routes(app):
                 return jsonify({"error": "Usuário não encontrado"}), 404
             return jsonify(res.data[0])
         except Exception as e:
+            log.exception("me failed")
             return jsonify({"error": str(e)}), 500
 
 
 def create_first_admin(email: str, password: str, name: str = "Admin"):
-    """Helper pra criar o primeiro admin manualmente."""
     db = _db()
     if db.table("users").select("id").eq("email", email.lower()).execute().data:
         print(f"Já existe: {email}")
