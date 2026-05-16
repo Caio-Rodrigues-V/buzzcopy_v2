@@ -1,5 +1,5 @@
 """
-auth.py — Autenticação JWT + decorators de proteção.
+auth.py — Autenticação JWT + ownership por profile_id.
 """
 import os
 import logging
@@ -14,13 +14,11 @@ log = logging.getLogger("pulse.auth")
 
 JWT_SECRET = os.environ.get("JWT_SECRET")
 JWT_ALG = "HS256"
-JWT_EXP_HOURS = 24 * 7  # 1 semana
+JWT_EXP_HOURS = 24 * 7
 
 if not JWT_SECRET or JWT_SECRET == "change-me-in-prod":
     raise RuntimeError("JWT_SECRET não configurado (ou ainda no default). Defina uma chave segura.")
 
-
-# ── SINGLETON DB CLIENT (Fix #9) ──────────────────────────────────────────────
 _db_client = None
 
 
@@ -40,13 +38,12 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 def generate_token(user_id: str, role: str) -> str:
-    payload = {
+    return jwt.encode({
         "user_id": user_id,
         "role": role,
         "exp": datetime.now(timezone.utc) + timedelta(hours=JWT_EXP_HOURS),
         "iat": datetime.now(timezone.utc),
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
+    }, JWT_SECRET, algorithm=JWT_ALG)
 
 
 def decode_token(token: str) -> dict:
@@ -59,9 +56,8 @@ def require_auth(f):
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return jsonify({"error": "Token não fornecido"}), 401
-        token = auth.split(" ", 1)[1]
         try:
-            payload = decode_token(token)
+            payload = decode_token(auth.split(" ", 1)[1])
             g.user_id = payload["user_id"]
             g.role = payload.get("role", "client")
         except jwt.ExpiredSignatureError:
@@ -90,19 +86,32 @@ def require_admin(f):
     return wrapper
 
 
-def user_owns_profile(username: str, user_id: str, platform: str = "instagram") -> bool:
-    """Verifica se o usuário é dono do perfil monitorado."""
+def user_owns_profile_id(profile_id: str, user_id: str) -> bool:
+    """Verifica se o user é dono do profile pelo ID direto."""
     db = _db()
     res = (
         db.table("profiles")
         .select("id")
-        .eq("platform_id", username)
-        .eq("platform", platform)
+        .eq("id", profile_id)
         .eq("user_id", user_id)
         .limit(1)
         .execute()
     )
     return bool(res.data)
+
+
+def guard_profile(profile_id: str):
+    """Retorna response 403/404 se o user não pode acessar; None se OK."""
+    if g.role == "admin":
+        # Admin precisa só confirmar que o profile existe
+        db = _db()
+        res = db.table("profiles").select("id").eq("id", profile_id).limit(1).execute()
+        if not res.data:
+            return jsonify({"error": "Profile não encontrado"}), 404
+        return None
+    if not user_owns_profile_id(profile_id, g.user_id):
+        return jsonify({"error": "Acesso negado a este profile"}), 403
+    return None
 
 
 # ── ROTAS ─────────────────────────────────────────────────────────────────────
@@ -136,7 +145,6 @@ def register_auth_routes(app):
                 "role": role,
             }).execute()
 
-            # Log de criação de admin (Fix #16 mini)
             if role == "admin":
                 log.warning("⚠️ Novo ADMIN criado: %s por %s", email, g.user_id)
 
