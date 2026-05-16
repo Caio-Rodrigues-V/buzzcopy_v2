@@ -233,7 +233,98 @@ def collect_youtube(channel_id):
         log.exception("collect_youtube failed")
         return jsonify({"error": str(e)}), 500
 
+# ── COLETA UNIFICADA (v2) ─────────────────────────────────────────────────────
 
+from collectors.instagram import InstagramCollector
+
+COLLECTOR_REGISTRY = {
+    "instagram": InstagramCollector,
+    # "twitter": TwitterCollector,   ← Rodada 2
+    # "news":    NewsCollector,      ← Rodada 3
+}
+
+
+def _get_collector(platform: str):
+    klass = COLLECTOR_REGISTRY.get(platform)
+    if not klass:
+        return None
+    return klass()
+
+
+@app.route("/v2/collect/<profile_id>", methods=["POST"])
+@require_auth
+def v2_collect(profile_id):
+    """
+    Coleta unificada: pega o profile, lê os handles, e dispara coleta
+    em cada plataforma configurada.
+
+    Query params:
+      - platforms: csv de plataformas a coletar (default: todas que o profile tem)
+      - posts_limit: posts por plataforma (default 50)
+      - reactions_per_post: comentários por post (default 20)
+    """
+    try:
+        db = get_db()
+        profile_res = db.table("profiles").select("*").eq("id", profile_id).execute()
+        if not profile_res.data:
+            return jsonify({"error": "Profile não encontrado"}), 404
+
+        profile = profile_res.data[0]
+        if g.role != "admin" and profile["user_id"] != g.user_id:
+            return jsonify({"error": "Acesso negado a este profile"}), 403
+
+        handles = profile.get("handles") or {}
+        if not handles:
+            return jsonify({"error": "Profile sem handles configurados"}), 400
+
+        requested = request.args.get("platforms")
+        platforms = [p.strip() for p in requested.split(",")] if requested else list(handles.keys())
+
+        posts_limit = int(request.args.get("posts_limit", 50))
+        reactions_per_post = int(request.args.get("reactions_per_post", 20))
+
+        results = {}
+        for platform in platforms:
+            handle = handles.get(platform)
+            if not handle:
+                results[platform] = {"skipped": "handle não configurado"}
+                continue
+
+            collector = _get_collector(platform)
+            if not collector:
+                results[platform] = {"skipped": "coletor não implementado"}
+                continue
+
+            # Coleta posts
+            posts = collector.collect_posts(handle, profile_id, limit=posts_limit)
+            if posts:
+                db.table("social_posts").upsert(posts, on_conflict="id").execute()
+
+            # Coleta reactions
+            reactions = collector.collect_reactions(
+                handle, profile_id,
+                posts_limit=min(posts_limit, 10),
+                reactions_per_post=reactions_per_post,
+            )
+            if reactions:
+                db.table("social_comments").upsert(reactions, on_conflict="id").execute()
+
+            results[platform] = {
+                "handle":           handle,
+                "posts_saved":      len(posts),
+                "reactions_saved":  len(reactions),
+            }
+
+        return jsonify({
+            "profile_id": profile_id,
+            "name":       profile["name"],
+            "results":    results,
+        })
+
+    except Exception as e:
+        log.exception("v2_collect failed")
+        return jsonify({"error": str(e)}), 500
+    
 @app.route("/collect/instagram/<username>", methods=["POST"])
 @require_auth
 def collect_instagram(username):
