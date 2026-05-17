@@ -4,10 +4,6 @@ collectors/twitter.py — Coleta tweets + replies via 2 atores Apify.
 Atores:
   - apidojo/tweet-scraper           → tweets do perfil ($0.40 / 1000 tweets)
   - scraper_one/x-post-replies-scraper → replies por post URL (pay per event)
-
-Fluxo:
-  1. collect_posts: usa apidojo/tweet-scraper com handle, devolve N tweets com URL
-  2. collect_reactions: lê URLs do banco, chama scraper_one pra cada batch
 """
 import os
 import logging
@@ -32,42 +28,36 @@ class TwitterCollector(BaseCollector):
 
     # ── HELPER ────────────────────────────────────────────────────────
 
-def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[Dict]:
-    url = f"{APIFY_BASE}/{actor_id}/run-sync-get-dataset-items?token={self.token}"
-    try:
-        response = requests.post(url, json=payload, timeout=timeout)
-        data = response.json()
-    except Exception:
-        log.exception("Falha chamando ator %s", actor_id)
-        return []
+    def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[Dict]:
+        url = f"{APIFY_BASE}/{actor_id}/run-sync-get-dataset-items?token={self.token}"
+        try:
+            response = requests.post(url, json=payload, timeout=timeout)
+            data = response.json()
+        except Exception:
+            log.exception("Falha chamando ator %s", actor_id)
+            return []
 
-    if not isinstance(data, list):
-        log.warning("Resposta inesperada do %s: %s", actor_id, str(data)[:300])
-        return []
+        if not isinstance(data, list):
+            log.warning("Resposta inesperada do %s: %s", actor_id, str(data)[:300])
+            return []
 
-    # Detecta resposta "demo" (twitter-profile-scraper bugado)
-    if data and all(item.get("demo") is True for item in data):
-        log.error("Ator %s retornou apenas dados demo (token/ator com bug).", actor_id)
-        return []
+        if data and all(item.get("demo") is True for item in data):
+            log.error("Ator %s retornou apenas dados demo (token/ator com bug).", actor_id)
+            return []
 
-    # Detecta resposta "noResults" (tweet-scraper sem matches do filtro)
-    if data and all(item.get("noResults") is True for item in data):
-        log.error(
-            "Ator %s retornou apenas 'noResults' — filtros muito restritivos "
-            "(idioma errado, sem tweets no período, perfil bloqueado). "
-            "Cobrança AINDA foi feita pelo Apify.",
-            actor_id,
-        )
-        return []
+        if data and all(item.get("noResults") is True for item in data):
+            log.error(
+                "Ator %s retornou apenas 'noResults' — filtros muito restritivos. "
+                "Cobrança AINDA foi feita pelo Apify.",
+                actor_id,
+            )
+            return []
 
-    return data
-    # ── POSTS (tweets originais) ─────────────────────────────────────
+        return data
+
+    # ── POSTS ────────────────────────────────────────────────────────
 
     def collect_posts(self, handle: str, profile_id: str, limit: int = 30) -> List[Dict]:
-        """
-        Coleta tweets via apidojo/tweet-scraper.
-        handle: username sem @ (ex: 'LulaOficial')
-        """
         payload = {
             "twitterHandles": [handle],
             "maxItems":       limit,
@@ -95,11 +85,9 @@ def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[D
                 or handle
             )
 
-            # Filtra só tweets do próprio handle
             if author_username.lower() != handle_lower:
                 continue
 
-            # Skip retweets nativos
             if t.get("isRetweet") or t.get("retweeted_status"):
                 continue
 
@@ -128,7 +116,7 @@ def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[D
         log.info("Twitter: %s tweets coletados de @%s", len(rows), handle)
         return rows
 
-    # ── REPLIES (comments dos tweets) ────────────────────────────────
+    # ── REPLIES ──────────────────────────────────────────────────────
 
     def collect_reactions(
         self,
@@ -137,13 +125,9 @@ def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[D
         posts_limit: int = 10,
         reactions_per_post: int = 20,
     ) -> List[Dict]:
-        """
-        Coleta replies dos tweets já salvos via scraper_one/x-post-replies-scraper.
-        """
         from supabase import create_client
         db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
-        # Pega URLs dos tweets recentes desse profile
         recent_posts = (
             db.table("social_posts")
             .select("id, external_id, url")
@@ -160,7 +144,6 @@ def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[D
             return []
 
         urls = [p["url"] for p in recent_posts if p.get("url")]
-        # Mapa external_id (raw tweet ID, sem prefixo tw_) → row id no banco
         ext_to_post_id = {p["external_id"]: p["id"] for p in recent_posts if p.get("external_id")}
 
         if not urls:
@@ -196,7 +179,6 @@ def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[D
             parent_id = r.get("inReplyTo") or r.get("postId") or r.get("conversationId")
             post_id = ext_to_post_id.get(str(parent_id)) if parent_id else None
 
-            # Converte timestamp ms pra ISO
             ts = r.get("timestamp")
             posted_at = None
             if ts:
