@@ -32,27 +32,35 @@ class TwitterCollector(BaseCollector):
 
     # ── HELPER ────────────────────────────────────────────────────────
 
-    def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[Dict]:
-        """Roda o ator e retorna lista de items, ou [] em qualquer erro."""
-        url = f"{APIFY_BASE}/{actor_id}/run-sync-get-dataset-items?token={self.token}"
-        try:
-            response = requests.post(url, json=payload, timeout=timeout)
-            data = response.json()
-        except Exception:
-            log.exception("Falha chamando ator %s", actor_id)
-            return []
+def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[Dict]:
+    url = f"{APIFY_BASE}/{actor_id}/run-sync-get-dataset-items?token={self.token}"
+    try:
+        response = requests.post(url, json=payload, timeout=timeout)
+        data = response.json()
+    except Exception:
+        log.exception("Falha chamando ator %s", actor_id)
+        return []
 
-        if not isinstance(data, list):
-            log.warning("Resposta inesperada do %s: %s", actor_id, str(data)[:300])
-            return []
+    if not isinstance(data, list):
+        log.warning("Resposta inesperada do %s: %s", actor_id, str(data)[:300])
+        return []
 
-        # Detecta bug "demo" do ator
-        if data and all(item.get("demo") is True for item in data):
-            log.error("Ator %s retornou apenas dados demo (token/ator com bug).", actor_id)
-            return []
+    # Detecta resposta "demo" (twitter-profile-scraper bugado)
+    if data and all(item.get("demo") is True for item in data):
+        log.error("Ator %s retornou apenas dados demo (token/ator com bug).", actor_id)
+        return []
 
-        return data
+    # Detecta resposta "noResults" (tweet-scraper sem matches do filtro)
+    if data and all(item.get("noResults") is True for item in data):
+        log.error(
+            "Ator %s retornou apenas 'noResults' — filtros muito restritivos "
+            "(idioma errado, sem tweets no período, perfil bloqueado). "
+            "Cobrança AINDA foi feita pelo Apify.",
+            actor_id,
+        )
+        return []
 
+    return data
     # ── POSTS (tweets originais) ─────────────────────────────────────
 
     def collect_posts(self, handle: str, profile_id: str, limit: int = 30) -> List[Dict]:
@@ -64,6 +72,7 @@ class TwitterCollector(BaseCollector):
             "twitterHandles": [handle],
             "maxItems":       limit,
             "sort":           "Latest",
+            "tweetLanguage":  "pt",
         }
 
         items = self._run_actor(ACTOR_TWEETS, payload)
