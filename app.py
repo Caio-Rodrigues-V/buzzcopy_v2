@@ -701,7 +701,7 @@ def warroom_negative_feed():
 @require_auth
 def warroom_generate_response():
     try:
-        from anthropic import Anthropic
+        from anthropic import AnthropicBedrock
 
         data = request.get_json(force=True) or {}
         attack = data.get("attack", "").strip()
@@ -717,7 +717,7 @@ def warroom_generate_response():
             denied = guard_profile(profile_id)
             if denied: return denied
 
-        client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+        client = AnthropicBedrock(aws_region=os.environ.get("AWS_REGION", "us-east-1"))
 
         prompt = f"""Você é um estrategista de comunicação política sênior numa War Room de campanha brasileira.
 
@@ -743,7 +743,7 @@ Responda APENAS com JSON válido:
 }}"""
 
         msg = client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-haiku-4-5-20251001-v1:0"),
             max_tokens=1500,
             temperature=0.8,
             messages=[{"role": "user", "content": prompt}],

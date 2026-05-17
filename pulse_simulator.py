@@ -1,24 +1,18 @@
-"""
-Engine de simulação multi-agente do Pulse.
-Inspirado em MiroFish, simplificado pra rodar com Claude Haiku.
-
-v1.2 - Adição de inferência estatística:
-       - Bootstrap resampling pra intervalo de confiança
-       - Margem de erro nas métricas principais
-       - Tamanho de amostra efetiva por cluster
-"""
-
 import json
 import asyncio
 import os
 import random
 import statistics
-from anthropic import AsyncAnthropic
+from anthropic import AsyncAnthropicBedrock
 from typing import List, Dict, Tuple
 from collections import Counter
 from personas_br import gerar_lote
 
-client = AsyncAnthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+client = AsyncAnthropicBedrock(
+    aws_region=os.environ.get("AWS_REGION", "us-east-1"),
+)
+
+MODEL = os.environ.get("BEDROCK_MODEL_ID", "anthropic.claude-haiku-4-5-20251001-v1:0")
 
 
 # ── PROMPT ────────────────────────────────────────────────────────────────────
@@ -109,7 +103,7 @@ async def _simular_agente(persona: Dict, conteudo: str, contexto_cenario: str) -
 
     try:
         msg = await client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model=MODEL,
             max_tokens=700,
             temperature=1.0,
             messages=[{"role": "user", "content": prompt}],
