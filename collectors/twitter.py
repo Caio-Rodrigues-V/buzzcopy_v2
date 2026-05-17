@@ -1,21 +1,27 @@
 """
-collectors/twitter.py — Coleta tweets e replies via Apify (otimizado, 1 call).
+collectors/twitter.py — Coleta tweets + replies via 2 atores Apify.
 
-Usa o ator apidojo/twitter-profile-scraper com includeTweetReplies=True numa
-única chamada, e separa posts vs replies localmente em Python.
+Atores:
+  - apidojo/tweet-scraper           → tweets do perfil ($0.40 / 1000 tweets)
+  - scraper_one/x-post-replies-scraper → replies por post URL (pay per event)
+
+Fluxo:
+  1. collect_posts: usa apidojo/tweet-scraper com handle, devolve N tweets com URL
+  2. collect_reactions: lê URLs do banco, chama scraper_one pra cada batch
 """
 import os
 import logging
 import requests
-from typing import List, Dict, Tuple
-from datetime import datetime, timedelta, timezone
+from typing import List, Dict
+from datetime import datetime, timezone
 
 from .base import BaseCollector
 
 log = logging.getLogger("pulse.collector.twitter")
 
 APIFY_BASE = "https://api.apify.com/v2/acts"
-ACTOR_ID = "apidojo~twitter-profile-scraper"
+ACTOR_TWEETS  = "apidojo~tweet-scraper"
+ACTOR_REPLIES = "scraper_one~x-post-replies-scraper"
 
 
 class TwitterCollector(BaseCollector):
@@ -23,68 +29,50 @@ class TwitterCollector(BaseCollector):
 
     def __init__(self, apify_token: str = None):
         self.token = apify_token or os.environ["APIFY_TOKEN"]
-        # Cache do último run pra evitar chamar 2x quando collect_posts
-        # e collect_reactions são disparados na mesma request
-        self._cache: Dict[str, Tuple[float, List[Dict]]] = {}
-        self._cache_ttl = 60  # segundos
 
-    # ── HELPER: 1 chamada ao Apify, retorna tudo ──────────────────────
+    # ── HELPER ────────────────────────────────────────────────────────
 
-    def _fetch_all(self, handle: str, total_items: int) -> List[Dict]:
-        """Chama o ator UMA vez com replies=True e cacheia por 60s."""
-        cache_key = f"{handle}:{total_items}"
-        now = datetime.now(timezone.utc).timestamp()
-
-        # Cache hit (se collect_reactions vier logo depois de collect_posts)
-        if cache_key in self._cache:
-            ts, data = self._cache[cache_key]
-            if now - ts < self._cache_ttl:
-                log.info("Twitter: cache hit pra @%s (%s items)", handle, len(data))
-                return data
-
-        start = (datetime.now(timezone.utc) - timedelta(days=60)).strftime("%Y-%m-%d")
-        end = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-        payload = {
-            "twitterHandles":        [handle],
-            "startDate":             start,
-            "endDate":               end,
-            "maxItems":              total_items,
-            "includeNativeRetweets": False,
-            "onlyImages":            False,
-            "includeTweetReplies":   True,
-            "minReplyCount":         0,
-        }
-
-        url = f"{APIFY_BASE}/{ACTOR_ID}/run-sync-get-dataset-items?token={self.token}"
+    def _run_actor(self, actor_id: str, payload: Dict, timeout: int = 300) -> List[Dict]:
+        """Roda o ator e retorna lista de items, ou [] em qualquer erro."""
+        url = f"{APIFY_BASE}/{actor_id}/run-sync-get-dataset-items?token={self.token}"
         try:
-            response = requests.post(url, json=payload, timeout=300)
+            response = requests.post(url, json=payload, timeout=timeout)
             data = response.json()
         except Exception:
-            log.exception("Falha chamando ator Twitter")
+            log.exception("Falha chamando ator %s", actor_id)
             return []
 
         if not isinstance(data, list):
-            log.warning("Resposta inesperada Apify Twitter: %s", str(data)[:300])
+            log.warning("Resposta inesperada do %s: %s", actor_id, str(data)[:300])
             return []
 
-        self._cache[cache_key] = (now, data)
-        log.info("Twitter: %s items retornados pra @%s (posts + replies)", len(data), handle)
+        # Detecta bug "demo" do ator
+        if data and all(item.get("demo") is True for item in data):
+            log.error("Ator %s retornou apenas dados demo (token/ator com bug).", actor_id)
+            return []
+
         return data
 
-    # ── POSTS (tweets originais do perfil) ───────────────────────────
+    # ── POSTS (tweets originais) ─────────────────────────────────────
 
     def collect_posts(self, handle: str, profile_id: str, limit: int = 30) -> List[Dict]:
         """
-        Coleta tweets do perfil. Pede 1x ao Apify com replies juntas e
-        filtra só os tweets originais (autor = handle, sem reply parent).
+        Coleta tweets via apidojo/tweet-scraper.
+        handle: username sem @ (ex: 'LulaOficial')
         """
-        # Pede limite generoso pra ter posts + replies suficientes
-        total_items = limit * 10
-        items = self._fetch_all(handle, total_items)
-        handle_lower = handle.lower()
+        payload = {
+            "twitterHandles": [handle],
+            "maxItems":       limit,
+            "sort":           "Latest",
+        }
+
+        items = self._run_actor(ACTOR_TWEETS, payload)
+        if not items:
+            return []
 
         rows = []
+        handle_lower = handle.lower()
+
         for t in items:
             tweet_id = t.get("id") or t.get("tweetId") or t.get("id_str")
             if not tweet_id:
@@ -95,18 +83,15 @@ class TwitterCollector(BaseCollector):
                 author.get("userName")
                 or author.get("screen_name")
                 or t.get("user", {}).get("screen_name")
-                or ""
+                or handle
             )
 
-            # Só tweets do próprio handle, e não-replies
+            # Filtra só tweets do próprio handle
             if author_username.lower() != handle_lower:
                 continue
-            is_reply = bool(
-                t.get("inReplyToId")
-                or t.get("in_reply_to_status_id")
-                or t.get("inReplyToStatusId")
-            )
-            if is_reply:
+
+            # Skip retweets nativos
+            if t.get("isRetweet") or t.get("retweeted_status"):
                 continue
 
             rows.append(self._build_post(
@@ -116,28 +101,25 @@ class TwitterCollector(BaseCollector):
                 author_name=author.get("name") or t.get("user", {}).get("name"),
                 content=t.get("text") or t.get("full_text") or "",
                 url=t.get("url") or t.get("twitterUrl") or f"https://x.com/{author_username}/status/{tweet_id}",
-                post_type="retweet" if t.get("isRetweet") else "tweet",
+                post_type="tweet",
                 posted_at=t.get("createdAt") or t.get("created_at"),
                 hashtags=[h.get("text") if isinstance(h, dict) else h
                           for h in (t.get("hashtags") or [])],
                 metrics={
-                    "likes":     t.get("likeCount")    or t.get("favorite_count") or 0,
-                    "retweets":  t.get("retweetCount") or 0,
-                    "replies":   t.get("replyCount")   or 0,
-                    "quotes":    t.get("quoteCount")   or 0,
-                    "views":     t.get("viewCount")    or 0,
+                    "likes":     t.get("likeCount")     or 0,
+                    "retweets":  t.get("retweetCount")  or 0,
+                    "replies":   t.get("replyCount")    or 0,
+                    "quotes":    t.get("quoteCount")    or 0,
+                    "views":     t.get("viewCount")     or 0,
                     "bookmarks": t.get("bookmarkCount") or 0,
                 },
                 external_id=str(tweet_id),
             ))
 
-            if len(rows) >= limit:
-                break
-
-        log.info("Twitter: %s tweets originais filtrados de @%s", len(rows), handle)
+        log.info("Twitter: %s tweets coletados de @%s", len(rows), handle)
         return rows
 
-    # ── COMENTÁRIOS (replies aos tweets) ──────────────────────────────
+    # ── REPLIES (comments dos tweets) ────────────────────────────────
 
     def collect_reactions(
         self,
@@ -147,65 +129,72 @@ class TwitterCollector(BaseCollector):
         reactions_per_post: int = 20,
     ) -> List[Dict]:
         """
-        Lê do CACHE do collect_posts (mesma run do Apify, 0 chamadas extras).
-        Se cache vazio, faz 1 chamada.
+        Coleta replies dos tweets já salvos via scraper_one/x-post-replies-scraper.
         """
         from supabase import create_client
         db = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
 
+        # Pega URLs dos tweets recentes desse profile
         recent_posts = (
             db.table("social_posts")
-            .select("id, external_id")
+            .select("id, external_id, url")
             .eq("platform", "twitter")
             .eq("profile_id", profile_id)
+            .not_.is_("url", "null")
             .order("posted_at", desc=True)
             .limit(posts_limit)
             .execute()
         ).data or []
 
-        ext_to_post_id = {p["external_id"]: p["id"] for p in recent_posts if p.get("external_id")}
-
-        if not ext_to_post_id:
+        if not recent_posts:
             log.warning("Nenhum tweet em social_posts pra @%s — rode collect_posts primeiro", handle)
             return []
 
-        # Mesma chamada cacheada de collect_posts
-        total_items = posts_limit * 10
-        items = self._fetch_all(handle, total_items)
-        handle_lower = handle.lower()
+        urls = [p["url"] for p in recent_posts if p.get("url")]
+        # Mapa external_id (raw tweet ID, sem prefixo tw_) → row id no banco
+        ext_to_post_id = {p["external_id"]: p["id"] for p in recent_posts if p.get("external_id")}
+
+        if not urls:
+            return []
+
+        payload = {
+            "postUrls":     urls,
+            "resultsLimit": reactions_per_post,
+        }
+
+        items = self._run_actor(ACTOR_REPLIES, payload, timeout=600)
+        if not items:
+            return []
 
         rows = []
         for r in items:
-            reply_id = r.get("id") or r.get("tweetId") or r.get("id_str")
+            reply_id = r.get("replyId") or r.get("id")
             if not reply_id:
+                continue
+
+            text = r.get("replyText") or r.get("text") or ""
+            if not text.strip():
                 continue
 
             author = r.get("author") or {}
             author_username = (
-                author.get("userName")
+                author.get("screenName")
+                or author.get("userName")
                 or author.get("screen_name")
                 or ""
             )
 
-            # Skip se é do próprio dono (não é reply de outro)
-            if author_username.lower() == handle_lower:
-                continue
-
-            text = r.get("text") or r.get("full_text") or ""
-            if not text.strip():
-                continue
-
-            parent_id = (
-                r.get("inReplyToId")
-                or r.get("conversationId")
-                or r.get("in_reply_to_status_id")
-                or r.get("inReplyToStatusId")
-            )
+            parent_id = r.get("inReplyTo") or r.get("postId") or r.get("conversationId")
             post_id = ext_to_post_id.get(str(parent_id)) if parent_id else None
 
-            # Só guarda se for reply a um tweet que coletamos
-            if not post_id:
-                continue
+            # Converte timestamp ms pra ISO
+            ts = r.get("timestamp")
+            posted_at = None
+            if ts:
+                try:
+                    posted_at = datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat()
+                except Exception:
+                    posted_at = None
 
             rows.append(self._build_comment(
                 comment_id=f"tw_r_{reply_id}",
@@ -213,16 +202,17 @@ class TwitterCollector(BaseCollector):
                 profile_id=profile_id,
                 author_username=author_username,
                 content=text,
-                posted_at=r.get("createdAt") or r.get("created_at"),
+                posted_at=posted_at,
                 metrics={
-                    "likes":    r.get("likeCount")    or 0,
-                    "retweets": r.get("retweetCount") or 0,
-                    "replies":  r.get("replyCount")   or 0,
-                    "views":    r.get("viewCount")    or 0,
+                    "likes":    r.get("favouriteCount") or 0,
+                    "retweets": r.get("repostCount")    or 0,
+                    "replies":  r.get("replyCount")     or 0,
+                    "quotes":   r.get("quoteCount")     or 0,
+                    "views":    int(r.get("viewsCount") or 0) if str(r.get("viewsCount") or "").isdigit() else 0,
                 },
                 reply_to_id=str(parent_id) if parent_id else None,
                 external_id=str(reply_id),
             ))
 
-        log.info("Twitter: %s replies filtrados de @%s", len(rows), handle)
+        log.info("Twitter: %s replies coletados de @%s (%s posts)", len(rows), handle, len(urls))
         return rows
