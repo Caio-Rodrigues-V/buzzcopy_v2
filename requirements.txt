@@ -9,3 +9,13 @@ json-repair==0.30.0
 requests==2.32.3
 PyJWT==2.8.0
 bcrypt==4.1.3
+
+$apifyToken = "apify_api_EKjxcXmTNTvlXPIeLZS2nwDkhWi8QE423UIu"
+$url = "https://api.apify.com/v2/acts/kaitoeasyapi~twitter-x-data-tweet-scraper-pay-per-result/run-sync-get-dataset-items?token=$apifyToken"
+$body = @{
+    twitterHandles = @("LulaOficial")
+    maxItems       = 5
+    tweetLanguage  = "pt"
+} | ConvertTo-Json
+
+Invoke-RestMethod -Uri $url -Method POST -ContentType "application/json" -Body $body | ConvertTo-Json -Depth 3
