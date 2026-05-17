@@ -1,107 +1,168 @@
 -- ============================================================
--- Social Monitor — Schema Supabase
--- Rodar no SQL Editor do painel Supabase
+-- Pulse — Schema v3 (multi-handle unificado)
+-- BREAKING CHANGE: dropa tudo do v1/v2. Sem migração de dados.
 -- ============================================================
 
--- Extensão para UUID automático (já vem ativa no Supabase)
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
 
+-- ── DROP DO LEGADO ───────────────────────────────────────────
+DROP VIEW  IF EXISTS latest_reports          CASCADE;
+DROP TABLE IF EXISTS war_room_responses      CASCADE;
+DROP TABLE IF EXISTS simulacoes              CASCADE;
+DROP TABLE IF EXISTS analysis_reports        CASCADE;
+DROP TABLE IF EXISTS social_comments         CASCADE;
+DROP TABLE IF EXISTS social_posts            CASCADE;
+DROP TABLE IF EXISTS instagram_comments      CASCADE;
+DROP TABLE IF EXISTS instagram_posts         CASCADE;
+DROP TABLE IF EXISTS videos                  CASCADE;
+DROP TABLE IF EXISTS channel_snapshots       CASCADE;
+DROP TABLE IF EXISTS profiles                CASCADE;
+DROP TABLE IF EXISTS users                   CASCADE;
 
--- ── PERFIS MONITORADOS ────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS profiles (
-  id          UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-  platform    TEXT        NOT NULL CHECK (platform IN ('youtube','instagram','twitter','facebook','tiktok')),
-  platform_id TEXT        NOT NULL,
-  name        TEXT        NOT NULL,
-  active      BOOLEAN     DEFAULT TRUE,
-  created_at  TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE (platform, platform_id)
+
+-- ── USERS ────────────────────────────────────────────────────
+CREATE TABLE users (
+  id            UUID         DEFAULT gen_random_uuid() PRIMARY KEY,
+  email         TEXT         UNIQUE NOT NULL,
+  password_hash TEXT         NOT NULL,
+  name          TEXT,
+  role          TEXT         NOT NULL DEFAULT 'client' CHECK (role IN ('admin','client')),
+  active        BOOLEAN      DEFAULT TRUE,
+  last_login    TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ  DEFAULT NOW()
 );
 
+CREATE INDEX idx_users_email ON users (email) WHERE active = TRUE;
 
--- ── SNAPSHOTS DO CANAL (métricas ao longo do tempo) ──────────────────────────
-CREATE TABLE IF NOT EXISTS channel_snapshots (
-  id               UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-  channel_id       TEXT        NOT NULL,
-  name             TEXT,
-  subscriber_count BIGINT,
-  video_count      INT,
-  total_views      BIGINT,
-  engagement_rate  FLOAT,
-  collected_at     TIMESTAMPTZ DEFAULT NOW()
+
+-- ── PROFILES (1 alvo = N handles) ────────────────────────────
+CREATE TABLE profiles (
+  id          UUID         DEFAULT gen_random_uuid() PRIMARY KEY,
+  user_id     UUID         REFERENCES users(id) ON DELETE CASCADE,
+  name        TEXT         NOT NULL,
+  handles     JSONB        NOT NULL DEFAULT '{}'::jsonb,
+  active      BOOLEAN      DEFAULT TRUE,
+  created_at  TIMESTAMPTZ  DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_snapshots_channel ON channel_snapshots (channel_id, collected_at DESC);
+CREATE INDEX idx_profiles_user ON profiles (user_id);
+CREATE INDEX idx_profiles_handles ON profiles USING GIN (handles);
 
 
--- ── VÍDEOS ────────────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS videos (
-  id            UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-  channel_id    TEXT        NOT NULL,
-  video_id      TEXT        UNIQUE NOT NULL,
-  title         TEXT,
-  published_at  TIMESTAMPTZ,
-  view_count    BIGINT      DEFAULT 0,
-  like_count    BIGINT      DEFAULT 0,
-  comment_count INT         DEFAULT 0,
-  url           TEXT,
-  thumbnail     TEXT,
-  collected_at  TIMESTAMPTZ DEFAULT NOW()
+-- ── SOCIAL POSTS (unificado) ─────────────────────────────────
+-- IDs são TEXT pq os collectors usam prefixos: yt_xxx, tw_xxx, instagram raw
+CREATE TABLE social_posts (
+  id              TEXT         PRIMARY KEY,
+  profile_id      UUID         NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  platform        TEXT         NOT NULL CHECK (platform IN ('instagram','twitter','youtube')),
+  external_id     TEXT,
+  author_username TEXT,
+  author_name     TEXT,
+  content         TEXT,
+  post_type       TEXT         DEFAULT 'post',
+  url             TEXT,
+  source_domain   TEXT,
+  metrics         JSONB        DEFAULT '{}'::jsonb,
+  hashtags        JSONB        DEFAULT '[]'::jsonb,
+  posted_at       TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ  DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_videos_channel ON videos (channel_id, published_at DESC);
+CREATE INDEX idx_posts_profile_platform ON social_posts (profile_id, platform, posted_at DESC);
+CREATE INDEX idx_posts_platform_author  ON social_posts (platform, author_username);
 
 
--- ── RELATÓRIOS DE ANÁLISE ─────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS analysis_reports (
-  id                  UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-  channel_id          TEXT        NOT NULL,
-  profile_name        TEXT,
-  period_days         INT         DEFAULT 30,
-  comments_analyzed   INT         DEFAULT 0,
+-- ── SOCIAL COMMENTS (unificado) ──────────────────────────────
+CREATE TABLE social_comments (
+  id              TEXT         PRIMARY KEY,
+  post_id         TEXT         REFERENCES social_posts(id) ON DELETE SET NULL,
+  profile_id      UUID         NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  platform        TEXT         NOT NULL CHECK (platform IN ('instagram','twitter','youtube')),
+  external_id     TEXT,
+  author_username TEXT,
+  content         TEXT,
+  sentiment       TEXT         CHECK (sentiment IN ('positive','negative','neutral')),
+  metrics         JSONB        DEFAULT '{}'::jsonb,
+  reply_to_id     TEXT,
+  posted_at       TIMESTAMPTZ,
+  created_at      TIMESTAMPTZ  DEFAULT NOW()
+);
 
-  -- Sentimento (percentuais)
+CREATE INDEX idx_comments_profile_posted  ON social_comments (profile_id, posted_at DESC);
+CREATE INDEX idx_comments_platform        ON social_comments (profile_id, platform);
+CREATE INDEX idx_comments_sentiment       ON social_comments (profile_id, sentiment) WHERE sentiment IS NOT NULL;
+
+
+-- ── ANALYSIS REPORTS (cross-platform) ────────────────────────
+CREATE TABLE analysis_reports (
+  id                  UUID         DEFAULT gen_random_uuid() PRIMARY KEY,
+  profile_id          UUID         NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
+  platforms_analyzed  JSONB,
+  comments_analyzed   INT          DEFAULT 0,
   positive_pct        FLOAT,
   negative_pct        FLOAT,
   neutral_pct         FLOAT,
-  overall_score       FLOAT,      -- -1.0 a 1.0
-
-  -- Alertas
-  crisis_alert        BOOLEAN     DEFAULT FALSE,
+  overall_score       FLOAT,
+  crisis_alert        BOOLEAN      DEFAULT FALSE,
   crisis_reason       TEXT,
-
-  -- Conteúdo qualitativo
-  main_themes         JSONB,      -- ["tema1", "tema2"]
+  main_themes         JSONB,
   top_positive_quote  TEXT,
   top_negative_quote  TEXT,
-  narrative           TEXT,       -- resumo executivo
-
-  -- Métricas do canal no período
-  channel_metrics     JSONB,
-
-  created_at          TIMESTAMPTZ DEFAULT NOW()
+  narrative           TEXT,
+  by_platform         JSONB,
+  created_at          TIMESTAMPTZ  DEFAULT NOW()
 );
 
-CREATE INDEX IF NOT EXISTS idx_reports_channel    ON analysis_reports (channel_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_reports_crisis     ON analysis_reports (crisis_alert) WHERE crisis_alert = TRUE;
-CREATE INDEX IF NOT EXISTS idx_reports_score      ON analysis_reports (overall_score);
+CREATE INDEX idx_reports_profile  ON analysis_reports (profile_id, created_at DESC);
+CREATE INDEX idx_reports_crisis   ON analysis_reports (crisis_alert) WHERE crisis_alert = TRUE;
 
 
--- ── VIEW: último relatório por canal ─────────────────────────────────────────
-CREATE OR REPLACE VIEW latest_reports AS
-SELECT DISTINCT ON (channel_id) *
-FROM analysis_reports
-ORDER BY channel_id, created_at DESC;
+-- ── SIMULACOES ───────────────────────────────────────────────
+CREATE TABLE simulacoes (
+  id          UUID         DEFAULT gen_random_uuid() PRIMARY KEY,
+  profile_id  UUID         REFERENCES profiles(id) ON DELETE CASCADE,
+  user_id     UUID         REFERENCES users(id) ON DELETE CASCADE,
+  conteudo    TEXT         NOT NULL,
+  n_agentes   INT          DEFAULT 100,
+  filtros     JSONB,
+  contexto    TEXT,
+  forecast    JSONB        NOT NULL,
+  created_at  TIMESTAMPTZ  DEFAULT NOW()
+);
+
+CREATE INDEX idx_sim_profile ON simulacoes (profile_id, created_at DESC);
+CREATE INDEX idx_sim_user    ON simulacoes (user_id, created_at DESC);
 
 
--- ── RLS (segurança básica — ajuste conforme necessidade) ─────────────────────
-ALTER TABLE profiles          ENABLE ROW LEVEL SECURITY;
-ALTER TABLE channel_snapshots ENABLE ROW LEVEL SECURITY;
-ALTER TABLE videos            ENABLE ROW LEVEL SECURITY;
-ALTER TABLE analysis_reports  ENABLE ROW LEVEL SECURITY;
+-- ── WAR ROOM RESPONSES ───────────────────────────────────────
+CREATE TABLE war_room_responses (
+  id              UUID         DEFAULT gen_random_uuid() PRIMARY KEY,
+  profile_id      UUID         REFERENCES profiles(id) ON DELETE CASCADE,
+  user_id         UUID         REFERENCES users(id) ON DELETE CASCADE,
+  attack_content  TEXT         NOT NULL,
+  response_text   TEXT         NOT NULL,
+  strategy        TEXT         CHECK (strategy IN ('defensiva','ofensiva','desvio')),
+  simulation_data JSONB,
+  created_at      TIMESTAMPTZ  DEFAULT NOW()
+);
 
--- Permite leitura e escrita com a service key (usada pelo Flask)
-CREATE POLICY "allow_all_service" ON profiles          FOR ALL USING (true);
-CREATE POLICY "allow_all_service" ON channel_snapshots FOR ALL USING (true);
-CREATE POLICY "allow_all_service" ON videos            FOR ALL USING (true);
-CREATE POLICY "allow_all_service" ON analysis_reports  FOR ALL USING (true);
+CREATE INDEX idx_warroom_profile ON war_room_responses (profile_id, created_at DESC);
+
+
+-- ── RLS ──────────────────────────────────────────────────────
+-- Service key (Flask) bypassa RLS, mas mantém ativo pra segurança
+ALTER TABLE users               ENABLE ROW LEVEL SECURITY;
+ALTER TABLE profiles            ENABLE ROW LEVEL SECURITY;
+ALTER TABLE social_posts        ENABLE ROW LEVEL SECURITY;
+ALTER TABLE social_comments     ENABLE ROW LEVEL SECURITY;
+ALTER TABLE analysis_reports    ENABLE ROW LEVEL SECURITY;
+ALTER TABLE simulacoes          ENABLE ROW LEVEL SECURITY;
+ALTER TABLE war_room_responses  ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "service_all" ON users              FOR ALL USING (true);
+CREATE POLICY "service_all" ON profiles           FOR ALL USING (true);
+CREATE POLICY "service_all" ON social_posts       FOR ALL USING (true);
+CREATE POLICY "service_all" ON social_comments    FOR ALL USING (true);
+CREATE POLICY "service_all" ON analysis_reports   FOR ALL USING (true);
+CREATE POLICY "service_all" ON simulacoes         FOR ALL USING (true);
+CREATE POLICY "service_all" ON war_room_responses FOR ALL USING (true);
